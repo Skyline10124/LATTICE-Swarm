@@ -5,6 +5,7 @@ The CLI binary is `lattice`.
 Common commands:
 
 ```sh
+lattice code <task> [--model <name>] [--workdir <path>]
 lattice run <prompt> [--model <name>] [--provider <name>]
 lattice run --pipeline <agent> <prompt>
 lattice resolve <model> [--trace] [--provider <name>] [--json]
@@ -23,6 +24,18 @@ lattice validate [--dir <path>]
 lattice list agents
 lattice new agent <name>
 lattice tui [--model <name>]
+```
+
+## Coding Agent
+
+`lattice code` is the main-agent interface for repo-aware implementation work. It wraps the Runtime agent loop with a coding system prompt, top-level repository context, default file/search/edit/shell tools, streaming output and normal session persistence.
+
+Examples:
+
+```sh
+lattice code "diagnose and fix the failing cargo test" -m sonnet
+lattice code --workdir ~/project "add a focused regression test"
+lattice code --file task.md --continue
 ```
 
 ## Sessions

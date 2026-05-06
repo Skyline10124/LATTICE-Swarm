@@ -23,6 +23,7 @@ toml = "0.8"
 dirs = "5"
 colored = "2"
 anyhow = "1"
+base64 = "0.22"
 reqwest = { version = "0.12", features = ["rustls-tls"] }
 futures = "0.3"
 chrono = "0.4"

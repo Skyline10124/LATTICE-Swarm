@@ -2,7 +2,7 @@
 
 ![LATTICE banner](logo-banner.svg)
 
-Swarm is the user-facing LATTICE repository. It owns the CLI and TUI, and embeds the two implementation repositories as submodules:
+Swarm is the user-facing LATTICE repository. It owns the CLI, TUI and main-agent shell for repo-aware coding work, and embeds the two implementation repositories as submodules:
 
 - [LATTICE-Runtime](https://github.com/Skyline10124/LATTICE-Runtime): model routing, transports, agent loop, plugin runtime, bus and Python binding.
 - [LATTICE-Plugins](https://github.com/Skyline10124/LATTICE-Plugins): official typed plugins.
@@ -45,11 +45,14 @@ cargo fmt --all --check
 ## CLI
 
 ```sh
+cargo run -p lattice-cli -- code "fix the failing tests" -m sonnet
 cargo run -p lattice-cli -- run "1+1=?" -m deepseek-v4-flash
 cargo run -p lattice-cli -- resolve sonnet --trace
 cargo run -p lattice-cli -- models --auth
 cargo run -p lattice-cli -- tui -m sonnet
 ```
+
+`lattice code` is the Swarm main-agent entrypoint. It adds a coding system prompt, top-level repository context, file/edit/shell tools and session persistence around the Runtime agent loop.
 
 Credentials are read from environment variables or config:
 

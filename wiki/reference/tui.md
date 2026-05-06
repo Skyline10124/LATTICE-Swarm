@@ -18,4 +18,4 @@ Run:
 cargo run -p lattice-cli -- tui -m sonnet
 ```
 
-The TUI uses Runtime through the same `lattice-agent`, `lattice-bus` and `lattice-core` crates used by CLI commands.
+The TUI currently uses Runtime through the same lower crates used by CLI commands. The `lattice code` Module is the newer main-agent seam; the next UI pass should make the TUI an Adapter over that Module instead of duplicating agent construction.

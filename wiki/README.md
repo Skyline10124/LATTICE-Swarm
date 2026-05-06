@@ -2,7 +2,7 @@
 
 ![LATTICE banner](../logo-banner.svg)
 
-This wiki documents the user-facing Swarm repository: CLI, TUI, submodule layout and day-to-day development workflow.
+This wiki documents the user-facing Swarm repository: CLI, TUI, coding agent shell, submodule layout and day-to-day development workflow.
 
 ## Quick Navigation
 
@@ -18,6 +18,6 @@ This wiki documents the user-facing Swarm repository: CLI, TUI, submodule layout
 
 ## Repository Role
 
-Swarm is the entrypoint repository. It is the best repository to clone when using the full system locally, because it includes Runtime and Plugins as submodules.
+Swarm is the entrypoint repository. It is the best repository to clone when using the full system locally, because it includes Runtime and Plugins as submodules and exposes the main coding agent via `lattice code`.
 
 Runtime and Swarm are the main maintenance repositories. Plugins is independently maintained but consumed by Swarm as a submodule.

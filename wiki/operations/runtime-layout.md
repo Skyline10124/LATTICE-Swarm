@@ -3,7 +3,7 @@
 Swarm is not the runtime implementation. It hosts the CLI/TUI and submodule pointers.
 
 ```text
-Swarm CLI/TUI
+Swarm CLI/TUI/main agent
   → Runtime crates
   → official Plugins
 ```
@@ -11,7 +11,7 @@ Swarm CLI/TUI
 ## Main Maintenance Repositories
 
 - Runtime: execution internals, model calls, agent loop, plugin runtime, bus and Python binding.
-- Swarm: CLI/TUI, submodule pointers and user-facing workflows.
+- Swarm: CLI/TUI, main coding agent, submodule pointers and user-facing workflows.
 - Plugins: official typed plugins.
 
 The legacy mono-repo at `~/lattice` is no longer maintained.
