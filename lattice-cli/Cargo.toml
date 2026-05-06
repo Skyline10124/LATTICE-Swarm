@@ -9,11 +9,11 @@ name = "lattice"
 path = "src/main.rs"
 
 [dependencies]
-lattice-core = { git = "https://github.com/Skyline10124/LATTICE-Runtime.git", branch = "main" }
-lattice-agent = { git = "https://github.com/Skyline10124/LATTICE-Runtime.git", branch = "main" }
-lattice-bus = { git = "https://github.com/Skyline10124/LATTICE-Runtime.git", branch = "main" }
-lattice-plugin = { git = "https://github.com/Skyline10124/LATTICE-Runtime.git", branch = "main" }
-lattice-plugins = { git = "https://github.com/Skyline10124/LATTICE-Plugins.git", branch = "main" }
+lattice-core = { path = "../LATTICE-Runtime/lattice-core" }
+lattice-agent = { path = "../LATTICE-Runtime/lattice-agent" }
+lattice-bus = { path = "../LATTICE-Runtime/lattice-bus" }
+lattice-plugin = { path = "../LATTICE-Runtime/lattice-plugin" }
+lattice-plugins = { path = "../LATTICE-Plugins/lattice-plugins" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tracing = "0.1"
 clap = { version = "4", features = ["derive", "env"] }

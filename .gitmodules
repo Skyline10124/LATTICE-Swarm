@@ -1,0 +1,6 @@
+[submodule "LATTICE-Runtime"]
+	path = LATTICE-Runtime
+	url = git@github.com:Skyline10124/LATTICE-Runtime.git
+[submodule "LATTICE-Plugins"]
+	path = LATTICE-Plugins
+	url = git@github.com:Skyline10124/LATTICE-Plugins.git
