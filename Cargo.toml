@@ -1,0 +1,9 @@
+[workspace]
+resolver = "2"
+members = ["lattice-cli"]
+
+[workspace.package]
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2021"
+authors = ["LATTICE Contributors"]
