@@ -19,6 +19,7 @@ pub(super) enum Event {
     /// Tool execution progress and output delivered from the background task.
     ToolOutput {
         turn_id: u64,
+        call_id: String,
         name: String,
         arguments: String,
         result: Option<String>,

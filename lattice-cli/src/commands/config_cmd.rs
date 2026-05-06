@@ -41,6 +41,12 @@ save_sessions = true
 [ui]
 theme = "dark"
 show_reasoning = true
+
+[security]
+sandbox_mode = "project"
+hook_chain = true
+landlock = false
+audit = false
 "#;
             std::fs::write(&config_path, default)?;
             println!(
@@ -57,6 +63,32 @@ show_reasoning = true
                 "core.save_sessions" => println!("{} = {}", key, config.core.save_sessions),
                 "ui.theme" => println!("{} = {}", key, config.ui.theme),
                 "ui.show_reasoning" => println!("{} = {}", key, config.ui.show_reasoning),
+                "security.sandbox_mode" => println!("{} = {}", key, config.security.sandbox_mode),
+                "security.hook_chain" => println!("{} = {}", key, config.security.hook_chain),
+                "security.landlock" => println!("{} = {}", key, config.security.landlock),
+                "security.audit" => println!("{} = {}", key, config.security.audit),
+                "security.audit_dir" => println!("{} = {:?}", key, config.security.audit_dir),
+                "security.max_command_timeout" => {
+                    println!("{} = {:?}", key, config.security.max_command_timeout)
+                }
+                "security.max_read_size" => {
+                    println!("{} = {:?}", key, config.security.max_read_size)
+                }
+                "security.max_write_size" => {
+                    println!("{} = {:?}", key, config.security.max_write_size)
+                }
+                "security.max_http_response_size" => {
+                    println!("{} = {:?}", key, config.security.max_http_response_size)
+                }
+                "security.read_allowlist" => {
+                    println!("{} = {:?}", key, config.security.read_allowlist)
+                }
+                "security.write_allowlist" => {
+                    println!("{} = {:?}", key, config.security.write_allowlist)
+                }
+                "security.command_allowlist" => {
+                    println!("{} = {:?}", key, config.security.command_allowlist)
+                }
                 _ => println!("{}: unknown key", key.red()),
             }
         }
@@ -117,7 +149,12 @@ show_reasoning = true
 
 fn config_value_for_key(key: &str, value: &str) -> Result<toml_edit::Item> {
     match key {
-        "core.stream" | "core.save_sessions" | "ui.show_reasoning" => {
+        "core.stream"
+        | "core.save_sessions"
+        | "ui.show_reasoning"
+        | "security.hook_chain"
+        | "security.landlock"
+        | "security.audit" => {
             let parsed = value.parse::<bool>().map_err(|_| {
                 anyhow!(
                     "{} expects a boolean value (true or false), got '{}'",
@@ -126,6 +163,27 @@ fn config_value_for_key(key: &str, value: &str) -> Result<toml_edit::Item> {
                 )
             })?;
             Ok(toml_edit::value(parsed))
+        }
+        "security.max_command_timeout" => Ok(toml_edit::value(
+            value
+                .parse::<u32>()
+                .map(i64::from)
+                .map_err(|_| anyhow!("{} expects an integer value, got '{}'", key, value))?,
+        )),
+        "security.max_read_size"
+        | "security.max_write_size"
+        | "security.max_http_response_size" => Ok(toml_edit::value(
+            value
+                .parse::<usize>()
+                .map(|n| n as i64)
+                .map_err(|_| anyhow!("{} expects an integer value, got '{}'", key, value))?,
+        )),
+        "security.read_allowlist" | "security.write_allowlist" | "security.command_allowlist" => {
+            let mut array = toml_edit::Array::new();
+            for item in value.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                array.push(item);
+            }
+            Ok(toml_edit::Item::Value(toml_edit::Value::Array(array)))
         }
         _ => Ok(toml_edit::value(value)),
     }

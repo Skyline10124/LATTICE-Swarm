@@ -7,6 +7,7 @@ use crossterm::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io::{self, Write};
+use std::path::PathBuf;
 
 use crate::config::Config;
 use crate::credentials::CredentialStore;
@@ -41,9 +42,11 @@ pub(crate) struct TuiOptions {
     pub(crate) model: String,
     pub(crate) provider_override: Option<String>,
     pub(crate) workdir: std::path::PathBuf,
+    pub(crate) plugin_dir: Option<PathBuf>,
     pub(crate) credentials: std::collections::HashMap<String, String>,
     pub(crate) save_sessions: bool,
     pub(crate) previous_session: Option<crate::session::Session>,
+    pub(crate) security_config: crate::config::SecurityConfig,
 }
 
 pub(crate) async fn run(options: TuiOptions) -> Result<()> {
@@ -65,6 +68,12 @@ pub(crate) async fn run(options: TuiOptions) -> Result<()> {
     app.workdir = options.workdir;
     app.credentials = options.credentials;
     app.save_sessions = options.save_sessions;
+    let security = crate::security::build_runtime_security(&options.security_config, &app.workdir)?;
+    app.security = security;
+    app.security_config = options.security_config;
+    app.plugin_registry = Some(crate::plugins::build_plugin_registry(
+        options.plugin_dir.as_deref(),
+    )?);
     if let Some(session) = options.previous_session {
         app.load_session(session);
     }
@@ -101,6 +110,8 @@ pub(crate) fn options_from_config(
     creds: &CredentialStore,
     save_sessions: bool,
     previous_session: Option<crate::session::Session>,
+    security_config: crate::config::SecurityConfig,
+    plugin_dir: Option<PathBuf>,
 ) -> TuiOptions {
     let model = model
         .or_else(|| {
@@ -115,9 +126,11 @@ pub(crate) fn options_from_config(
         model,
         provider_override,
         workdir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        plugin_dir,
         credentials: creds.to_hashmap(),
         save_sessions,
         previous_session,
+        security_config,
     }
 }
 
@@ -141,15 +154,21 @@ async fn run_app<B: ratatui::backend::Backend>(
                     done,
                     error,
                 } => {
+                    let turn_finished = done || error.is_some();
                     app.apply_stream_token(turn_id, content, reasoning, done, error);
+                    if turn_finished {
+                        app.reap_audit().await;
+                        app.submit_next_queued().await?;
+                    }
                 }
                 event::Event::ToolOutput {
                     turn_id,
+                    call_id,
                     name,
                     arguments,
                     result,
                 } => {
-                    app.apply_tool_output(turn_id, name, arguments, result);
+                    app.apply_tool_output(turn_id, call_id, name, arguments, result);
                 }
                 event::Event::ModelInfo {
                     turn_id,

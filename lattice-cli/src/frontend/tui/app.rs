@@ -1,11 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use anyhow::Result;
 use base64::Engine as _;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-use lattice_agent::{Agent, LoopEvent};
-use lattice_core::types::Role;
+use lattice_agent::{prompt::SystemPromptDelta, Agent, LoopEvent};
+use lattice_core::types::{Role, ToolDefinition};
+use lattice_plugin::registry::PluginRegistry;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
 
@@ -71,6 +72,7 @@ fn dispatch_loop_event(
             for call in calls {
                 let _ = tx.send(Event::ToolOutput {
                     turn_id,
+                    call_id: call.id,
                     name: call.function.name,
                     arguments: call.function.arguments,
                     result: None,
@@ -80,6 +82,7 @@ fn dispatch_loop_event(
         LoopEvent::ToolResult { call, result } => {
             let _ = tx.send(Event::ToolOutput {
                 turn_id,
+                call_id: call.id,
                 name: call.function.name,
                 arguments: call.function.arguments,
                 result: Some(result),
@@ -105,9 +108,29 @@ pub(super) struct ChatMessage {
     pub(super) content: String,
     pub(super) reasoning: Option<String>,
     pub(super) collapsed: bool,
+    pub(super) reasoning_collapsed: bool,
+    pub(super) tool: Option<ToolDisplay>,
     cached_lines:
         std::cell::RefCell<Option<(usize, std::sync::Arc<Vec<ratatui::text::Line<'static>>>)>>,
     cached_width: std::cell::Cell<Option<u16>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(super) enum ToolStatus {
+    Running,
+    Done,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ToolDisplay {
+    pub(super) call_id: String,
+    pub(super) name: String,
+    pub(super) arguments: String,
+    pub(super) result: Option<String>,
+    pub(super) status: ToolStatus,
+    pub(super) started_at: std::time::Instant,
+    pub(super) finished_at: Option<std::time::Instant>,
 }
 
 impl Clone for ChatMessage {
@@ -117,6 +140,8 @@ impl Clone for ChatMessage {
             content: self.content.clone(),
             reasoning: self.reasoning.clone(),
             collapsed: self.collapsed,
+            reasoning_collapsed: self.reasoning_collapsed,
+            tool: self.tool.clone(),
             cached_lines: std::cell::RefCell::new(None),
             cached_width: std::cell::Cell::new(None),
         }
@@ -130,6 +155,8 @@ impl std::fmt::Debug for ChatMessage {
             .field("content", &self.content)
             .field("reasoning", &self.reasoning)
             .field("collapsed", &self.collapsed)
+            .field("reasoning_collapsed", &self.reasoning_collapsed)
+            .field("tool", &self.tool)
             .finish_non_exhaustive()
     }
 }
@@ -141,9 +168,26 @@ impl ChatMessage {
             content,
             reasoning: None,
             collapsed: false,
+            reasoning_collapsed: true,
+            tool: None,
             cached_lines: std::cell::RefCell::new(None),
             cached_width: std::cell::Cell::new(None),
         }
+    }
+
+    pub(super) fn tool_call(call_id: String, name: String, arguments: String) -> Self {
+        let mut message = Self::new(Role::Tool, String::new());
+        message.collapsed = true;
+        message.tool = Some(ToolDisplay {
+            call_id,
+            name,
+            arguments,
+            result: None,
+            status: ToolStatus::Running,
+            started_at: std::time::Instant::now(),
+            finished_at: None,
+        });
+        message
     }
 
     pub(super) fn set_cache(
@@ -171,6 +215,11 @@ impl ChatMessage {
         } else {
             None
         }
+    }
+
+    pub(super) fn invalidate_cache(&self) {
+        self.cached_lines.replace(None);
+        self.cached_width.set(None);
     }
 }
 
@@ -218,8 +267,32 @@ const SLASH_COMMANDS: &[SlashSuggestion] = &[
         description: "show current session state",
     },
     SlashSuggestion {
+        command: "/permissions <mode>",
+        description: "switch sandbox mode for later turns",
+    },
+    SlashSuggestion {
+        command: "/plugins",
+        description: "list available runtime plugins",
+    },
+    SlashSuggestion {
+        command: "/plugin <name>",
+        description: "run a prompt through a plugin",
+    },
+    SlashSuggestion {
         command: "/tokens",
         description: "show token breakdown",
+    },
+    SlashSuggestion {
+        command: "/find <text>",
+        description: "search the visible transcript",
+    },
+    SlashSuggestion {
+        command: "/next",
+        description: "jump to next search match",
+    },
+    SlashSuggestion {
+        command: "/prev",
+        description: "jump to previous search match",
     },
     SlashSuggestion {
         command: "/effort <off|low..max>",
@@ -242,6 +315,10 @@ const SLASH_COMMANDS: &[SlashSuggestion] = &[
         description: "force-save current session",
     },
     SlashSuggestion {
+        command: "/queue",
+        description: "show or clear queued prompts",
+    },
+    SlashSuggestion {
         command: "/sessions restore <id>",
         description: "list or restore a session",
     },
@@ -250,6 +327,22 @@ const SLASH_COMMANDS: &[SlashSuggestion] = &[
         description: "exit the TUI",
     },
 ];
+
+impl SlashSuggestion {
+    pub(super) fn name(&self) -> &'static str {
+        self.command
+            .split_whitespace()
+            .next()
+            .unwrap_or(self.command)
+    }
+
+    fn completion(&self) -> String {
+        match self.command.find('<') {
+            Some(idx) => self.command[..idx].trim_end().to_string() + " ",
+            None => self.name().to_string(),
+        }
+    }
+}
 
 /// Application state.
 pub(super) struct App {
@@ -270,6 +363,9 @@ pub(super) struct App {
     pub(super) credentials: HashMap<String, String>,
     pub(super) workdir: std::path::PathBuf,
     pub(super) save_sessions: bool,
+    pub(super) security: crate::security::RuntimeSecurity,
+    pub(super) security_config: crate::config::SecurityConfig,
+    pub(super) plugin_registry: Option<Arc<PluginRegistry>>,
     pub(super) session: Option<crate::session::Session>,
     pub(super) pending_user: Option<String>,
     pub(super) event_tx: Option<UnboundedSender<Event>>,
@@ -277,6 +373,9 @@ pub(super) struct App {
     pub(super) active_turn_id: Option<u64>,
     pub(super) next_turn_id: u64,
     pub(super) active_assistant_index: Option<usize>,
+    pub(super) queued_inputs: VecDeque<String>,
+    pub(super) suggestion_index: usize,
+    prepared_submission: Option<PreparedSubmission>,
     input_history: Vec<String>,
     history_index: Option<usize>,
     draft_before_history: String,
@@ -291,6 +390,8 @@ pub(super) struct App {
     pub(super) visible_rows: std::cell::RefCell<Vec<String>>,
     pub(super) visible_rows_origin: std::cell::Cell<u16>,
     pub(super) menu: Option<MenuState>,
+    pub(super) search: SearchState,
+    active_plugin: Option<RunPluginContext>,
     clipboard: ClipboardSink,
 }
 
@@ -305,6 +406,44 @@ pub(super) struct MenuState {
 pub(super) enum MenuKind {
     Model,
     Provider,
+    Permissions,
+    Plugin,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct SearchState {
+    pub(super) query: String,
+    pub(super) matches: Vec<usize>,
+    pub(super) index: Option<usize>,
+    pub(super) target_message: Option<usize>,
+}
+
+impl SearchState {
+    pub(super) fn is_active(&self) -> bool {
+        !self.query.is_empty()
+    }
+
+    pub(super) fn position(&self) -> Option<(usize, usize)> {
+        self.index
+            .filter(|_| !self.matches.is_empty())
+            .map(|idx| (idx + 1, self.matches.len()))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PreparedSubmission {
+    display: String,
+    prompt: String,
+    raw_prompt: Option<String>,
+    plugin: Option<RunPluginContext>,
+}
+
+#[derive(Debug, Clone)]
+struct RunPluginContext {
+    name: String,
+    system_prompt: String,
+    output_contract_delta: Option<SystemPromptDelta>,
+    tools: Vec<ToolDefinition>,
 }
 
 #[derive(Debug, Clone)]
@@ -354,6 +493,12 @@ impl App {
             credentials: HashMap::new(),
             workdir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             save_sessions: false,
+            security_config: crate::config::SecurityConfig::default(),
+            security: crate::security::default_runtime_security(
+                &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            )
+            .expect("default runtime security should build"),
+            plugin_registry: crate::plugins::build_plugin_registry(None).ok(),
             session: None,
             pending_user: None,
             event_tx: None,
@@ -361,6 +506,9 @@ impl App {
             active_turn_id: None,
             next_turn_id: 1,
             active_assistant_index: None,
+            queued_inputs: VecDeque::new(),
+            suggestion_index: 0,
+            prepared_submission: None,
             input_history: Vec::new(),
             history_index: None,
             draft_before_history: String::new(),
@@ -374,6 +522,8 @@ impl App {
             selection: None,
             visible_rows: std::cell::RefCell::new(Vec::new()),
             visible_rows_origin: std::cell::Cell::new(0),
+            search: SearchState::default(),
+            active_plugin: None,
             clipboard: Arc::new(write_osc52_clipboard),
         }
     }
@@ -390,6 +540,10 @@ impl App {
         self.agent = None;
         self.previous_model.clear();
         self.scroll_offset = 0;
+        self.queued_inputs.clear();
+        self.clear_search();
+        self.prepared_submission = None;
+        self.active_plugin = None;
     }
 
     fn begin_turn(&mut self, user: String) -> u64 {
@@ -426,8 +580,23 @@ impl App {
         (self.clipboard)(text);
     }
 
+    fn toggle_recent_reasoning(&mut self) {
+        if let Some(msg) = self.messages.iter_mut().rev().find(|msg| {
+            msg.role == Role::Assistant && msg.reasoning.as_deref().is_some_and(|r| !r.is_empty())
+        }) {
+            msg.reasoning_collapsed = !msg.reasoning_collapsed;
+            msg.invalidate_cache();
+        } else {
+            self.transcript_mode = !self.transcript_mode;
+        }
+    }
+
     pub(super) fn tick(&mut self) {
         self.spinner_index = self.spinner_index.wrapping_add(1);
+    }
+
+    pub(super) async fn reap_audit(&self) {
+        crate::security::reap_audit(&self.security).await;
     }
 
     pub(super) async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -477,12 +646,41 @@ impl App {
                                 self.agent = None;
                                 self.push_system_message(&format!("Provider: {selected}"));
                             }
+                            MenuKind::Permissions => {
+                                self.switch_permissions(&selected);
+                            }
+                            MenuKind::Plugin => {
+                                self.input = format!("/plugin {selected} ");
+                                self.input_cursor = self.input.len();
+                                self.suggestion_index = 0;
+                            }
                         }
                     }
                     return Ok(());
                 }
                 KeyCode::Esc | KeyCode::Char(' ') => {
                     self.menu = None;
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
+        let suggestions = self.slash_suggestions();
+        if !suggestions.is_empty() {
+            match key.code {
+                KeyCode::Tab => {
+                    self.accept_selected_suggestion();
+                    return Ok(());
+                }
+                KeyCode::Up => {
+                    self.suggestion_index = self.suggestion_index.saturating_sub(1);
+                    return Ok(());
+                }
+                KeyCode::Down => {
+                    if self.suggestion_index + 1 < suggestions.len() {
+                        self.suggestion_index += 1;
+                    }
                     return Ok(());
                 }
                 _ => {}
@@ -496,13 +694,24 @@ impl App {
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.cancel_active_turn();
                 self.messages.clear();
+                self.queued_inputs.clear();
+                self.clear_search();
                 self.help_open = false;
             }
             KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.reset_conversation();
             }
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.transcript_mode = !self.transcript_mode;
+                self.toggle_recent_reasoning();
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.input = "/find ".into();
+                self.input_cursor = self.input.len();
+                self.exit_history_mode();
+                self.help_open = false;
+            }
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.jump_search_next();
             }
             KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.toggle_tool_expand();
@@ -518,17 +727,20 @@ impl App {
                 self.exit_history_mode();
                 self.input.insert(self.input_cursor, c);
                 self.input_cursor += c.len_utf8();
+                self.clamp_suggestion_index();
             }
             KeyCode::Backspace if self.input_cursor > 0 => {
                 let prev = prev_char_boundary(&self.input, self.input_cursor);
                 self.input.remove(prev);
                 self.input_cursor = prev;
+                self.clamp_suggestion_index();
             }
             KeyCode::Delete
                 if self.input_cursor < self.input.len()
                     && self.input.is_char_boundary(self.input_cursor) =>
             {
                 self.input.remove(self.input_cursor);
+                self.clamp_suggestion_index();
             }
             KeyCode::Left if self.input_cursor > 0 => {
                 self.input_cursor = prev_char_boundary(&self.input, self.input_cursor);
@@ -560,9 +772,12 @@ impl App {
                     self.input_cursor = 0;
                 } else if self.help_open {
                     self.help_open = false;
+                } else if self.search.is_active() && self.input.is_empty() {
+                    self.clear_search();
                 } else if !self.input.is_empty() {
                     self.input.clear();
                     self.input_cursor = 0;
+                    self.suggestion_index = 0;
                 }
             }
             KeyCode::Up => {
@@ -597,6 +812,7 @@ impl App {
             self.input.insert(self.input_cursor, c);
             self.input_cursor += c.len_utf8();
         }
+        self.clamp_suggestion_index();
     }
 
     fn add_to_history(&mut self, text: String) {
@@ -742,17 +958,20 @@ impl App {
         }
         self.add_to_history(text.clone());
         if self.handle_slash_command(&text) {
+            if let Some(prepared) = self.prepared_submission.take() {
+                return self.submit_prepared(prepared).await;
+            }
             self.input.clear();
             self.input_cursor = 0;
             self.scroll_offset = 0;
+            self.suggestion_index = 0;
             return Ok(());
         }
         if self.active_turn_id.is_some() || self.status == AppStatus::Streaming {
-            self.push_system_message(
-                "A response is still streaming. Wait for it to finish or start a new session.",
-            );
+            self.queue_input(text);
             self.input.clear();
             self.input_cursor = 0;
+            self.suggestion_index = 0;
             return Ok(());
         }
 
@@ -762,11 +981,13 @@ impl App {
                 .push(ChatMessage::new(Role::User, text.clone()));
             self.input.clear();
             self.input_cursor = 0;
+            self.suggestion_index = 0;
             self.scroll_offset = 0;
             self.status = AppStatus::Streaming;
             self.stream_started = Some(std::time::Instant::now());
 
-            let output = match coding_agent::run_bash_tool(&self.workdir, cmd).await {
+            let output = match coding_agent::run_bash_tool(&self.workdir, &self.security, cmd).await
+            {
                 Ok(output) if output.trim().is_empty() => "(no output)".to_string(),
                 Ok(output) => output.trim().to_string(),
                 Err(err) => format!("bash: {err}"),
@@ -781,20 +1002,49 @@ impl App {
             return Ok(());
         }
 
-        // Add user message
+        self.submit_model_turn(text.clone(), text, None).await
+    }
+
+    async fn submit_prepared(&mut self, prepared: PreparedSubmission) -> Result<()> {
+        if self.active_turn_id.is_some() || self.status == AppStatus::Streaming {
+            let queued = match prepared.raw_prompt.as_deref() {
+                Some(raw) => prepared
+                    .plugin
+                    .as_ref()
+                    .map(|plugin| format!("/plugin {} {}", plugin.name, raw))
+                    .unwrap_or_else(|| prepared.display.clone()),
+                None => prepared.display.clone(),
+            };
+            self.queue_input(queued);
+            self.input.clear();
+            self.input_cursor = 0;
+            self.suggestion_index = 0;
+            return Ok(());
+        }
+        self.submit_model_turn(prepared.display, prepared.prompt, prepared.plugin)
+            .await
+    }
+
+    async fn submit_model_turn(
+        &mut self,
+        display_text: String,
+        prompt_text: String,
+        plugin: Option<RunPluginContext>,
+    ) -> Result<()> {
         self.messages
-            .push(ChatMessage::new(Role::User, text.clone()));
-        self.token_count += lattice_core::tokens::TokenEstimator::estimate_text(&text) as usize;
+            .push(ChatMessage::new(Role::User, display_text.clone()));
+        self.token_count +=
+            lattice_core::tokens::TokenEstimator::estimate_text(&display_text) as usize;
         self.input.clear();
         self.input_cursor = 0;
+        self.suggestion_index = 0;
         self.scroll_offset = 0;
         self.status = AppStatus::Streaming;
         self.stream_started = Some(std::time::Instant::now());
         self.reasoning_started = None;
         self.reasoning_duration = None;
-        let turn_id = self.begin_turn(text.clone());
+        let turn_id = self.begin_turn(display_text);
 
-        // Thinking indicator — replaced by real content once streaming starts
         self.messages
             .push(ChatMessage::new(Role::Assistant, String::new()));
 
@@ -807,7 +1057,6 @@ impl App {
             }
         };
 
-        // Rebuild agent if none exists or model changed.
         let needs_rebuild = self.agent.is_none() || self.current_model != self.previous_model;
 
         if needs_rebuild {
@@ -826,6 +1075,7 @@ impl App {
                 previous_session: self.session.clone(),
                 prior_messages,
                 thinking_effort: self.thinking_effort.clone(),
+                security: self.security.clone(),
             };
 
             let built = match tokio::task::spawn_blocking(move || {
@@ -849,6 +1099,7 @@ impl App {
             self.context_limit = built.context_limit;
             self.current_model = built.model.clone();
             self.current_provider = built.provider.clone();
+            self.active_plugin = None;
             let _ = tx.send(Event::ModelInfo {
                 turn_id,
                 model: built.model.clone(),
@@ -859,22 +1110,18 @@ impl App {
             self.previous_model = self.current_model.clone();
         }
 
-        // Clone Arc for spawned task — cheap, just increments ref count
-        let agent_arc = self.agent.clone().unwrap();
-        let text_for_spawn = text;
+        self.apply_requested_plugin_context(plugin.clone()).await;
 
+        let agent_arc = self.agent.clone().unwrap();
         tokio::spawn(async move {
             let mut agent = agent_arc.lock().await;
-            // Use run_streaming so each token is emitted in real-time
-            // as the LLM produces it, producing a typewriter effect.
             let errored = std::sync::atomic::AtomicBool::new(false);
             let _events = agent
-                .run_streaming(&text_for_spawn, 10, |event| {
+                .run_streaming(&prompt_text, 10, |event| {
                     dispatch_loop_event(&tx, turn_id, event, &errored);
                 })
                 .await;
 
-            // Send final done only if no error already signaled completion
             if !errored.load(std::sync::atomic::Ordering::Relaxed) {
                 let _ = tx.send(Event::StreamToken {
                     turn_id,
@@ -887,6 +1134,36 @@ impl App {
         });
 
         Ok(())
+    }
+
+    async fn apply_requested_plugin_context(&mut self, plugin: Option<RunPluginContext>) {
+        let Some(agent_arc) = self.agent.as_ref() else {
+            return;
+        };
+        if self.active_plugin.as_ref().map(|p| p.name.as_str())
+            == plugin.as_ref().map(|p| p.name.as_str())
+        {
+            return;
+        }
+
+        let mut agent = agent_arc.lock().await;
+        match plugin.as_ref() {
+            Some(plugin) => {
+                agent.set_system_prompt(&plugin_augmented_system_prompt(
+                    &self.workdir,
+                    &plugin.system_prompt,
+                ));
+                agent.set_output_contract_delta(plugin.output_contract_delta.clone());
+                if !plugin.tools.is_empty() {
+                    agent.add_tools(plugin.tools.clone());
+                }
+            }
+            None => {
+                agent.set_system_prompt(&coding_agent::coding_system_prompt(&self.workdir));
+                agent.set_output_contract_delta(None);
+            }
+        }
+        self.active_plugin = plugin;
     }
 
     fn handle_slash_command(&mut self, text: &str) -> bool {
@@ -943,13 +1220,83 @@ impl App {
                     &self.current_provider
                 };
                 self.push_system_message(&format!(
-                    "model={} provider={} messages={} tokens={} transcript={}",
+                    "model={} provider={} messages={} tokens={} transcript={} sandbox={} plugins={}",
                     self.current_model,
                     provider,
                     self.messages.len(),
                     self.token_count,
-                    if self.transcript_mode { "on" } else { "off" }
+                    if self.transcript_mode { "on" } else { "off" },
+                    self.security.mode_label,
+                    self.plugin_count(),
                 ));
+                true
+            }
+            "/permissions" | "/permission" => {
+                let mode = parts.next().unwrap_or("");
+                if mode.is_empty() {
+                    let modes = permission_modes();
+                    let idx = modes
+                        .iter()
+                        .position(|m| m == &self.security.mode_label)
+                        .unwrap_or(0);
+                    self.menu = Some(MenuState {
+                        kind: MenuKind::Permissions,
+                        options: modes,
+                        index: idx,
+                    });
+                } else {
+                    self.switch_permissions(mode);
+                }
+                true
+            }
+            "/plugins" => {
+                let names = self.plugin_names();
+                if names.is_empty() {
+                    self.push_system_message("No plugins loaded.");
+                } else {
+                    let lines = names
+                        .iter()
+                        .filter_map(|name| self.plugin_summary(name))
+                        .map(|(name, description)| format!("  {name:<16} {description}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.push_system_message(&format!(
+                        "{} plugin(s) loaded · /plugin <name> <prompt>:\n{}",
+                        names.len(),
+                        lines
+                    ));
+                }
+                true
+            }
+            "/plugin" => {
+                let name = parts.next().unwrap_or("");
+                let prompt = parts.collect::<Vec<_>>().join(" ");
+                if name.is_empty() {
+                    let names = self.plugin_names();
+                    if names.is_empty() {
+                        self.push_system_message("No plugins loaded.");
+                    } else {
+                        self.menu = Some(MenuState {
+                            kind: MenuKind::Plugin,
+                            options: names,
+                            index: 0,
+                        });
+                    }
+                } else if prompt.trim().is_empty() {
+                    if self.has_plugin(name) {
+                        self.input = format!("/plugin {name} ");
+                        self.input_cursor = self.input.len();
+                    } else {
+                        self.push_system_message(&format!(
+                            "Plugin not found: {name}. Use /plugins to list loaded plugins."
+                        ));
+                    }
+                } else {
+                    match self.prepare_plugin_prompt(name, prompt) {
+                        Ok(()) => {}
+                        Err(err) => self.push_system_message(&format!("Plugin failed: {err}")),
+                    }
+                }
                 true
             }
             "/provider" => {
@@ -1012,6 +1359,38 @@ impl App {
                 ));
                 true
             }
+            "/find" | "/search" => {
+                let query = parts.collect::<Vec<_>>().join(" ");
+                if query.is_empty() {
+                    if self.search.is_active() {
+                        let status = match self.search.position() {
+                            Some((current, total)) => {
+                                format!(
+                                    "Search: '{}' ({current}/{total}). Use /next, /prev, Esc to clear.",
+                                    self.search.query
+                                )
+                            }
+                            None => {
+                                format!("Search: '{}' (no matches).", self.search.query)
+                            }
+                        };
+                        self.push_system_message(&status);
+                    } else {
+                        self.push_system_message("Usage: /find <text>");
+                    }
+                } else {
+                    self.start_search(query);
+                }
+                true
+            }
+            "/next" => {
+                self.jump_search_next();
+                true
+            }
+            "/prev" | "/previous" => {
+                self.jump_search_prev();
+                true
+            }
             "/trace" => {
                 self.transcript_mode = !self.transcript_mode;
                 self.push_system_message(&format!(
@@ -1020,7 +1399,7 @@ impl App {
                     if self.transcript_mode {
                         "Reasoning will be shown inline."
                     } else {
-                        "Reasoning hidden · Ctrl+O or /trace to toggle."
+                        "Reasoning hidden by default · Ctrl+O expands the latest block."
                     },
                 ));
                 true
@@ -1077,6 +1456,37 @@ impl App {
                     }
                 } else {
                     self.push_system_message("No session to save yet. Send a message first.");
+                }
+                true
+            }
+            "/queue" => {
+                let sub = parts.next().unwrap_or("list");
+                match sub {
+                    "clear" => {
+                        let count = self.queued_inputs.len();
+                        self.queued_inputs.clear();
+                        self.push_system_message(&format!("Cleared {count} queued prompt(s)."));
+                    }
+                    _ => {
+                        if self.queued_inputs.is_empty() {
+                            self.push_system_message("Queue is empty.");
+                        } else {
+                            let lines = self
+                                .queued_inputs
+                                .iter()
+                                .enumerate()
+                                .map(|(idx, queued)| {
+                                    format!("  {}. {}", idx + 1, summarize_prompt(queued, 80))
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            self.push_system_message(&format!(
+                                "{} queued prompt(s) · /queue clear to drop:\n{}",
+                                self.queued_inputs.len(),
+                                lines
+                            ));
+                        }
+                    }
                 }
                 true
             }
@@ -1172,16 +1582,125 @@ impl App {
         self.scroll_offset = 0;
         self.help_open = false;
         self.token_count = 0;
+        self.queued_inputs.clear();
+        self.clear_search();
+        self.suggestion_index = 0;
         self.agent = None;
         self.previous_model.clear();
         self.session = None;
         self.pending_user = None;
+        self.prepared_submission = None;
+        self.active_plugin = None;
         self.status = AppStatus::Ready;
     }
 
     fn push_system_message(&mut self, content: &str) {
         self.messages
             .push(ChatMessage::new(Role::System, content.to_string()));
+    }
+
+    fn switch_permissions(&mut self, mode: &str) {
+        let normalized = mode.trim().to_ascii_lowercase();
+        if !permission_modes()
+            .iter()
+            .any(|candidate| candidate == &normalized)
+        {
+            self.push_system_message("Usage: /permissions <project|strict|permissive|off>");
+            return;
+        }
+
+        let mut next_config = self.security_config.clone();
+        next_config.sandbox_mode = normalized.clone();
+        match crate::security::build_runtime_security(&next_config, &self.workdir) {
+            Ok(security) => {
+                self.cancel_active_turn();
+                self.security_config = next_config;
+                self.security = security;
+                self.agent = None;
+                self.previous_model.clear();
+                self.active_plugin = None;
+                self.push_system_message(&format!(
+                    "Permissions switched to '{}'. Agent will rebuild next turn.",
+                    self.security.mode_label
+                ));
+            }
+            Err(err) => {
+                self.push_system_message(&format!("Permission switch failed: {err}"));
+            }
+        }
+    }
+
+    pub(super) fn plugin_count(&self) -> usize {
+        self.plugin_registry
+            .as_ref()
+            .map_or(0, |registry| registry.len())
+    }
+
+    pub(super) fn active_plugin_name(&self) -> Option<&str> {
+        self.active_plugin
+            .as_ref()
+            .map(|plugin| plugin.name.as_str())
+    }
+
+    fn plugin_names(&self) -> Vec<String> {
+        self.plugin_registry
+            .as_ref()
+            .map(|registry| crate::plugins::sorted_plugin_names(registry))
+            .unwrap_or_default()
+    }
+
+    fn has_plugin(&self, name: &str) -> bool {
+        self.find_plugin_name(name).is_some()
+    }
+
+    fn plugin_summary(&self, name: &str) -> Option<(String, String)> {
+        let registry = self.plugin_registry.as_ref()?;
+        let canonical = self.find_plugin_name(name)?;
+        let bundle = registry.get(&canonical)?;
+        Some((bundle.meta.name.clone(), bundle.meta.description.clone()))
+    }
+
+    fn prepare_plugin_prompt(&mut self, name: &str, prompt: String) -> Result<()> {
+        let registry = self
+            .plugin_registry
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("plugin registry is not initialized"))?;
+        let canonical = self
+            .find_plugin_name(name)
+            .ok_or_else(|| anyhow::anyhow!("plugin '{name}' is not loaded"))?;
+        let bundle = registry
+            .get(&canonical)
+            .ok_or_else(|| anyhow::anyhow!("plugin '{name}' is not loaded"))?;
+        let plugin_prompt = bundle
+            .plugin
+            .to_prompt_json(&plugin_context(&bundle.meta.name, &prompt, &self.workdir))
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        let display = format!("@{} {}", bundle.meta.name, prompt);
+        self.prepared_submission = Some(PreparedSubmission {
+            display,
+            prompt: plugin_prompt,
+            raw_prompt: Some(prompt),
+            plugin: Some(RunPluginContext {
+                name: bundle.meta.name.clone(),
+                system_prompt: bundle.plugin.system_prompt().to_string(),
+                output_contract_delta: output_contract_delta(bundle.plugin.output_schema()),
+                tools: bundle
+                    .plugin
+                    .tools()
+                    .iter()
+                    .cloned()
+                    .chain(bundle.default_tools.iter().cloned())
+                    .collect(),
+            }),
+        });
+        Ok(())
+    }
+
+    fn find_plugin_name(&self, query: &str) -> Option<String> {
+        let query = query.trim();
+        self.plugin_names()
+            .into_iter()
+            .find(|name| name == query || name.eq_ignore_ascii_case(query))
     }
 
     pub(super) fn slash_suggestions(&self) -> Vec<SlashSuggestion> {
@@ -1198,6 +1717,178 @@ impl App {
             .copied()
             .filter(|s| s.command.trim_start_matches('/').starts_with(&query))
             .collect()
+    }
+
+    fn clamp_suggestion_index(&mut self) {
+        let len = self.slash_suggestions().len();
+        if len == 0 {
+            self.suggestion_index = 0;
+        } else if self.suggestion_index >= len {
+            self.suggestion_index = len - 1;
+        }
+    }
+
+    fn accept_selected_suggestion(&mut self) {
+        let suggestions = self.slash_suggestions();
+        let Some(suggestion) = suggestions.get(self.suggestion_index).copied() else {
+            return;
+        };
+        let replacement = suggestion.completion();
+        self.input = replacement;
+        self.input_cursor = self.input.len();
+        self.suggestion_index = 0;
+    }
+
+    fn queue_input(&mut self, text: String) {
+        self.queued_inputs.push_back(text);
+        let count = self.queued_inputs.len();
+        self.push_system_message(&format!(
+            "Queued prompt #{count}. It will run after the current response."
+        ));
+    }
+
+    pub(super) async fn submit_next_queued(&mut self) -> Result<()> {
+        if self.status != AppStatus::Ready || self.active_turn_id.is_some() {
+            return Ok(());
+        }
+        let Some(next) = self.queued_inputs.pop_front() else {
+            return Ok(());
+        };
+        self.input = next;
+        self.input_cursor = self.input.len();
+        self.submit().await
+    }
+
+    fn start_search(&mut self, query: String) {
+        let query = query.trim().to_string();
+        if query.is_empty() {
+            self.clear_search();
+            return;
+        }
+
+        let lowered = query.to_ascii_lowercase();
+        let matches: Vec<usize> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, msg)| {
+                let content = if self.transcript_mode {
+                    match msg.reasoning.as_deref() {
+                        Some(reasoning) if !reasoning.is_empty() => {
+                            format!("{}\n{}", msg.content, reasoning)
+                        }
+                        _ => msg.content.clone(),
+                    }
+                } else {
+                    msg.content.clone()
+                };
+                content
+                    .to_ascii_lowercase()
+                    .contains(&lowered)
+                    .then_some(idx)
+            })
+            .collect();
+
+        self.search = SearchState {
+            query: query.clone(),
+            target_message: matches.first().copied(),
+            index: (!matches.is_empty()).then_some(0),
+            matches,
+        };
+
+        if self.search.matches.is_empty() {
+            self.scroll_offset = 0;
+            self.push_system_message(&format!("No matches for '{query}'."));
+        } else {
+            self.scroll_to_search_target();
+            if let Some((current, total)) = self.search.position() {
+                self.push_system_message(&format!("Search: '{query}' ({current}/{total})."));
+            }
+        }
+    }
+
+    fn jump_search_next(&mut self) {
+        if self.search.matches.is_empty() {
+            if self.search.is_active() {
+                self.push_system_message(&format!("No matches for '{}'.", self.search.query));
+            }
+            return;
+        }
+        let next = self
+            .search
+            .index
+            .map(|idx| (idx + 1) % self.search.matches.len())
+            .unwrap_or(0);
+        self.search.index = Some(next);
+        self.search.target_message = self.search.matches.get(next).copied();
+        self.scroll_to_search_target();
+    }
+
+    fn jump_search_prev(&mut self) {
+        if self.search.matches.is_empty() {
+            if self.search.is_active() {
+                self.push_system_message(&format!("No matches for '{}'.", self.search.query));
+            }
+            return;
+        }
+        let prev = self
+            .search
+            .index
+            .map(|idx| {
+                if idx == 0 {
+                    self.search.matches.len() - 1
+                } else {
+                    idx - 1
+                }
+            })
+            .unwrap_or(0);
+        self.search.index = Some(prev);
+        self.search.target_message = self.search.matches.get(prev).copied();
+        self.scroll_to_search_target();
+    }
+
+    fn scroll_to_search_target(&mut self) {
+        let Some(target) = self.search.target_message else {
+            return;
+        };
+        let rows_after_target: usize = self
+            .messages
+            .iter()
+            .skip(target.saturating_add(1))
+            .map(estimated_message_rows)
+            .sum();
+        self.scroll_offset = rows_after_target.saturating_add(2);
+    }
+
+    fn refresh_search_matches(&mut self) {
+        if !self.search.is_active() {
+            return;
+        }
+        let query = self.search.query.clone();
+        let previous_target = self.search.target_message;
+        let lowered = query.to_ascii_lowercase();
+        let matches: Vec<usize> = self
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, msg)| {
+                message_search_content(msg, self.transcript_mode)
+                    .to_ascii_lowercase()
+                    .contains(&lowered)
+                    .then_some(idx)
+            })
+            .collect();
+
+        let index = previous_target
+            .and_then(|target| matches.iter().position(|m| *m == target))
+            .or_else(|| (!matches.is_empty()).then_some(0));
+        self.search.matches = matches;
+        self.search.index = index;
+        self.search.target_message = index.and_then(|idx| self.search.matches.get(idx).copied());
+    }
+
+    fn clear_search(&mut self) {
+        self.search = SearchState::default();
     }
 
     pub(super) fn mode_label(&self) -> &'static str {
@@ -1300,6 +1991,7 @@ impl App {
             self.status = AppStatus::Ready;
             // Recalculate total token count from all messages for accuracy
             self.recount_tokens();
+            self.refresh_search_matches();
             // Cache is populated lazily on next render at message_lines()
             self.save_pending_turn();
             self.active_assistant_index = None;
@@ -1314,6 +2006,7 @@ impl App {
     pub(super) fn apply_tool_output(
         &mut self,
         turn_id: u64,
+        call_id: String,
         name: String,
         arguments: String,
         result: Option<String>,
@@ -1335,20 +2028,44 @@ impl App {
             }
         }
 
-        let content = match result {
-            Some(result) => format!(
-                "{} {}\n{}",
-                name,
-                compact_json(&arguments),
-                trim_tool_result(&result)
-            ),
-            None => format!("{} {}...", name, compact_json(&arguments)),
-        };
-
-        let mut msg = ChatMessage::new(Role::Tool, content);
-        msg.collapsed = true;
-        self.messages.push(msg);
+        if let Some(result) = result {
+            if let Some(msg) = self.messages.iter_mut().find(|msg| {
+                msg.tool
+                    .as_ref()
+                    .is_some_and(|tool| tool.call_id == call_id)
+            }) {
+                if let Some(tool) = msg.tool.as_mut() {
+                    tool.result = Some(result);
+                    tool.status = tool_result_status(tool.result.as_deref());
+                    tool.finished_at = Some(std::time::Instant::now());
+                    msg.content = tool_display_content(tool);
+                    msg.collapsed = msg.content.lines().count() > 6;
+                    msg.invalidate_cache();
+                }
+            } else {
+                let mut msg = ChatMessage::tool_call(call_id, name, arguments);
+                if let Some(tool) = msg.tool.as_mut() {
+                    tool.result = Some(result);
+                    tool.status = tool_result_status(tool.result.as_deref());
+                    tool.finished_at = Some(std::time::Instant::now());
+                    msg.content = tool_display_content(tool);
+                    msg.collapsed = msg.content.lines().count() > 6;
+                }
+                self.messages.push(msg);
+            }
+        } else if !self.messages.iter().any(|msg| {
+            msg.tool
+                .as_ref()
+                .is_some_and(|tool| tool.call_id == call_id)
+        }) {
+            let mut msg = ChatMessage::tool_call(call_id, name, arguments);
+            if let Some(tool) = msg.tool.as_ref() {
+                msg.content = tool_display_content(tool);
+            }
+            self.messages.push(msg);
+        }
         self.scroll_offset = 0;
+        self.refresh_search_matches();
     }
 
     pub(super) fn toggle_tool_expand(&mut self) {
@@ -1459,6 +2176,171 @@ fn trim_tool_result(result: &str) -> String {
     trimmed
 }
 
+fn tool_result_status(result: Option<&str>) -> ToolStatus {
+    let result = result.unwrap_or_default().trim_start().to_ascii_lowercase();
+    if result.starts_with("error")
+        || result.starts_with("sandbox violation")
+        || result.contains("permission denied")
+        || result.contains("timed out")
+    {
+        ToolStatus::Error
+    } else {
+        ToolStatus::Done
+    }
+}
+
+fn tool_display_content(tool: &ToolDisplay) -> String {
+    let mut content = format!("{} {}", tool.name, compact_json(&tool.arguments));
+    let elapsed = tool
+        .finished_at
+        .unwrap_or_else(std::time::Instant::now)
+        .saturating_duration_since(tool.started_at);
+    let status = match tool.status {
+        ToolStatus::Running => "running".to_string(),
+        ToolStatus::Done => format!("done in {}", format_short_duration(elapsed)),
+        ToolStatus::Error => format!("error after {}", format_short_duration(elapsed)),
+    };
+    content.push_str(&format!("\nstatus: {status}"));
+    if let Some(result) = tool.result.as_deref() {
+        content.push('\n');
+        content.push_str(&trim_tool_result(result));
+    }
+    content
+}
+
+fn format_short_duration(duration: std::time::Duration) -> String {
+    let millis = duration.as_millis();
+    if millis < 1000 {
+        format!("{millis}ms")
+    } else {
+        let secs = duration.as_secs_f32();
+        format!("{secs:.1}s")
+    }
+}
+
+fn message_search_content(msg: &ChatMessage, transcript_mode: bool) -> String {
+    if transcript_mode {
+        match msg.reasoning.as_deref() {
+            Some(reasoning) if !reasoning.is_empty() => {
+                format!("{}\n{}", msg.content, reasoning)
+            }
+            _ => msg.content.clone(),
+        }
+    } else {
+        msg.content.clone()
+    }
+}
+
+fn permission_modes() -> Vec<String> {
+    ["project", "strict", "permissive", "off"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn plugin_context(name: &str, prompt: &str, workdir: &std::path::Path) -> serde_json::Value {
+    match canonical_plugin_name(name).as_str() {
+        "CodeReview" | "code-review" => serde_json::json!({
+            "input": prompt,
+            "file_path": "",
+            "context_rules": []
+        }),
+        "Refactor" | "refactor" => serde_json::json!({
+            "code": prompt,
+            "review": null,
+            "instructions": prompt
+        }),
+        "TestGen" | "test-gen" => serde_json::json!({
+            "code": prompt,
+            "language": "",
+            "focus_areas": []
+        }),
+        "SecurityAudit" | "security-audit" => serde_json::json!({
+            "code": prompt,
+            "dependencies": [],
+            "threat_model": ""
+        }),
+        "DocGen" | "doc-gen" => serde_json::json!({
+            "code": prompt,
+            "doc_type": "technical",
+            "audience": "developers"
+        }),
+        "PlanGen" | "plan-gen" => serde_json::json!({
+            "spec": prompt,
+            "project_path": workdir.display().to_string(),
+            "context_rules": []
+        }),
+        "DeepResearch" | "deep-research" => serde_json::json!({
+            "query": prompt,
+            "sources": [],
+            "depth": "standard"
+        }),
+        "ImageGen" | "image-gen" => serde_json::json!({
+            "prompt": prompt,
+            "style": "",
+            "dimensions": ""
+        }),
+        "KnowledgeBase" | "knowledge-base" => serde_json::json!({
+            "query": prompt,
+            "kb_sources": []
+        }),
+        "PptxGen" | "pptx-gen" => serde_json::json!({
+            "topic": prompt,
+            "outline": [],
+            "template": ""
+        }),
+        "Verification" | "verification" => serde_json::json!({
+            "changes": [],
+            "plan_task_id": 0,
+            "verification_steps": [prompt]
+        }),
+        _ => serde_json::json!({ "input": prompt, "request": prompt }),
+    }
+}
+
+fn canonical_plugin_name(name: &str) -> String {
+    name.trim().to_string()
+}
+
+fn output_contract_delta(schema: Option<serde_json::Value>) -> Option<SystemPromptDelta> {
+    let schema = schema?;
+    let output_schema =
+        serde_json::to_string_pretty(&schema).unwrap_or_else(|_| schema.to_string());
+    Some(SystemPromptDelta::contract(
+        "Output contract:\nReturn only valid JSON matching this schema:\n{{output_schema}}",
+        HashMap::from([("output_schema".to_string(), output_schema)]),
+    ))
+}
+
+fn plugin_augmented_system_prompt(workdir: &std::path::Path, plugin_prompt: &str) -> String {
+    format!(
+        "{}\n\nPlugin mode:\n{}",
+        coding_agent::coding_system_prompt(workdir),
+        plugin_prompt
+    )
+}
+
+fn estimated_message_rows(msg: &ChatMessage) -> usize {
+    let content_rows = msg.content.lines().count().max(1);
+    let reasoning_rows = msg.reasoning.as_ref().map_or(0, |r| r.lines().count());
+    content_rows
+        .saturating_add(reasoning_rows)
+        .saturating_add(1)
+}
+
+fn summarize_prompt(text: &str, max_chars: usize) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut out = String::new();
+    for (idx, ch) in one_line.chars().enumerate() {
+        if idx >= max_chars {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 impl Default for App {
     fn default() -> Self {
         Self::new()
@@ -1566,12 +2448,165 @@ mod tests {
     }
 
     #[test]
+    fn accept_selected_suggestion_completes_command_name() {
+        let mut app = App::new();
+        app.input = "/f".into();
+        app.input_cursor = app.input.len();
+
+        app.accept_selected_suggestion();
+
+        assert_eq!(app.input, "/find ");
+        assert_eq!(app.input_cursor, app.input.len());
+    }
+
+    #[test]
+    fn queue_input_records_prompt_for_later() {
+        let mut app = App::new();
+
+        app.queue_input("next task".into());
+
+        assert_eq!(app.queued_inputs.len(), 1);
+        assert_eq!(app.queued_inputs.front().unwrap(), "next task");
+        assert_eq!(
+            app.messages.last().unwrap().content,
+            "Queued prompt #1. It will run after the current response."
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_next_queued_waits_until_ready() {
+        let mut app = App::new();
+        app.status = AppStatus::Streaming;
+        app.queued_inputs.push_back("/status".into());
+
+        app.submit_next_queued().await.unwrap();
+
+        assert_eq!(app.queued_inputs.len(), 1);
+        assert!(app.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn submit_next_queued_runs_slash_command() {
+        let mut app = App::new();
+        app.queued_inputs.push_back("/status".into());
+
+        app.submit_next_queued().await.unwrap();
+
+        assert!(app.queued_inputs.is_empty());
+        assert!(app.messages.last().unwrap().content.contains("model="));
+    }
+
+    #[test]
+    fn slash_queue_clear_drops_pending_prompts() {
+        let mut app = App::new();
+        app.queued_inputs.push_back("one".into());
+        app.queued_inputs.push_back("two".into());
+
+        assert!(app.handle_slash_command("/queue clear"));
+
+        assert!(app.queued_inputs.is_empty());
+        assert_eq!(
+            app.messages.last().unwrap().content,
+            "Cleared 2 queued prompt(s)."
+        );
+    }
+
+    #[test]
+    fn slash_permissions_switches_runtime_security() {
+        let mut app = App::new();
+
+        assert!(app.handle_slash_command("/permissions strict"));
+
+        assert_eq!(app.security.mode_label, "strict");
+        assert_eq!(app.security_config.sandbox_mode, "strict");
+        assert!(app.agent.is_none());
+        assert!(app
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .contains("Permissions switched"));
+    }
+
+    #[test]
+    fn slash_permissions_without_mode_opens_menu() {
+        let mut app = App::new();
+
+        assert!(app.handle_slash_command("/permissions"));
+
+        let menu = app.menu.expect("permissions should open menu");
+        assert!(matches!(menu.kind, MenuKind::Permissions));
+        assert!(menu.options.iter().any(|mode| mode == "project"));
+    }
+
+    #[test]
+    fn slash_plugins_lists_registry() {
+        let mut app = App::new();
+
+        assert!(app.handle_slash_command("/plugins"));
+
+        let msg = app.messages.last().unwrap().content.as_str();
+        assert!(msg.contains("plugin(s) loaded"));
+        assert!(msg.contains("/plugin <name> <prompt>"));
+    }
+
+    #[test]
+    fn slash_plugin_prepares_plugin_submission() {
+        let mut app = App::new();
+
+        assert!(app.handle_slash_command("/plugin CodeReview inspect this diff"));
+
+        let prepared = app
+            .prepared_submission
+            .as_ref()
+            .expect("plugin command should prepare a submission");
+        assert!(prepared.display.starts_with("@CodeReview "));
+        assert!(prepared.prompt.contains("CODE TO REVIEW"));
+        assert_eq!(prepared.plugin.as_ref().unwrap().name, "CodeReview");
+    }
+
+    #[test]
+    fn slash_find_tracks_matches_and_target() {
+        let mut app = App::new();
+        app.messages
+            .push(ChatMessage::new(Role::User, "alpha".into()));
+        app.messages
+            .push(ChatMessage::new(Role::Assistant, "beta alpha".into()));
+
+        assert!(app.handle_slash_command("/find alpha"));
+
+        assert_eq!(app.search.query, "alpha");
+        assert_eq!(app.search.matches, vec![0, 1]);
+        assert_eq!(app.search.position(), Some((1, 2)));
+        assert_eq!(app.search.target_message, Some(0));
+    }
+
+    #[test]
+    fn search_navigation_wraps() {
+        let mut app = App::new();
+        app.messages
+            .push(ChatMessage::new(Role::User, "alpha".into()));
+        app.messages
+            .push(ChatMessage::new(Role::Assistant, "beta alpha".into()));
+        app.start_search("alpha".into());
+
+        app.jump_search_next();
+        assert_eq!(app.search.position(), Some((2, 2)));
+        assert_eq!(app.search.target_message, Some(1));
+
+        app.jump_search_next();
+        assert_eq!(app.search.position(), Some((1, 2)));
+        assert_eq!(app.search.target_message, Some(0));
+    }
+
+    #[test]
     fn tool_output_adds_visible_tool_message() {
         let mut app = App::new();
         app.active_turn_id = Some(1);
 
         app.apply_tool_output(
             1,
+            "call-1".into(),
             "list_directory".into(),
             r#"{"path":"."}"#.into(),
             Some("FILE Cargo.toml".into()),
@@ -1581,6 +2616,45 @@ mod tests {
         assert_eq!(msg.role, Role::Tool);
         assert!(msg.content.contains("list_directory"));
         assert!(msg.content.contains("FILE Cargo.toml"));
+        assert_eq!(msg.tool.as_ref().unwrap().status, ToolStatus::Done);
+    }
+
+    #[test]
+    fn tool_output_updates_existing_call() {
+        let mut app = App::new();
+        app.active_turn_id = Some(1);
+
+        app.apply_tool_output(
+            1,
+            "call-1".into(),
+            "read_file".into(),
+            r#"{"path":"Cargo.toml"}"#.into(),
+            None,
+        );
+        app.apply_tool_output(
+            1,
+            "call-1".into(),
+            "read_file".into(),
+            r#"{"path":"Cargo.toml"}"#.into(),
+            Some("package data".into()),
+        );
+
+        assert_eq!(app.messages.len(), 1);
+        let msg = app.messages.last().unwrap();
+        assert!(msg.content.contains("package data"));
+        assert_eq!(msg.tool.as_ref().unwrap().status, ToolStatus::Done);
+    }
+
+    #[test]
+    fn toggle_recent_reasoning_flips_latest_assistant_block() {
+        let mut app = App::new();
+        let mut msg = ChatMessage::new(Role::Assistant, "answer".into());
+        msg.reasoning = Some("step one".into());
+        app.messages.push(msg);
+
+        app.toggle_recent_reasoning();
+
+        assert!(!app.messages.last().unwrap().reasoning_collapsed);
     }
 
     #[test]
@@ -1592,6 +2666,7 @@ mod tests {
         app.active_assistant_index = Some(0);
         app.apply_tool_output(
             1,
+            "call-1".into(),
             "read_file".into(),
             r#"{"path":"Cargo.toml"}"#.into(),
             None,

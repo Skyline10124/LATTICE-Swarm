@@ -7,6 +7,8 @@ mod config;
 mod credentials;
 mod display;
 mod frontend;
+mod plugins;
+mod security;
 mod session;
 
 use commands::{
@@ -192,6 +194,8 @@ enum Commands {
         prompt: Option<String>,
         #[arg(long, help = "Model alias or canonical ID")]
         model: Option<String>,
+        #[arg(long, help = "Local manifest plugin directory")]
+        plugins_dir: Option<String>,
     },
 }
 
@@ -232,12 +236,14 @@ async fn main() -> Result<()> {
     let config = Config::load(cli.config.as_deref())?;
     let creds = CredentialStore::from_config(&config)?;
     let save_sessions = config.core.save_sessions && !cli.no_save;
+    let cwd = std::env::current_dir()?;
 
     // Quick mode (single-turn, no tool execution, pipe-friendly)
     if let Some(prompt) = cli.quick {
         let model = cli.model.unwrap_or_else(|| config.default_model());
         let previous_session =
             load_requested_session(cli.session.as_deref(), cli.continue_session)?;
+        let security = security::build_runtime_security(&config.security, &cwd)?;
         return run::run(
             prompt,
             model,
@@ -251,6 +257,7 @@ async fn main() -> Result<()> {
             None,
             1,
             !cli.json,
+            security,
         )
         .await;
     }
@@ -326,6 +333,7 @@ async fn main() -> Result<()> {
                 } else {
                     config.core.stream
                 };
+                let security = security::build_runtime_security(&config.security, &cwd)?;
                 run::run(
                     prompt,
                     model,
@@ -339,6 +347,7 @@ async fn main() -> Result<()> {
                     system_prompt.as_deref(),
                     max_turns,
                     stream_output,
+                    security,
                 )
                 .await?;
             }
@@ -369,13 +378,15 @@ async fn main() -> Result<()> {
             } else {
                 config.core.stream
             };
+            let workdir = workdir
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| cwd.clone());
+            let security = security::build_runtime_security(&config.security, &workdir)?;
             let options = coding_agent::CodingAgentOptions {
                 prompt,
                 model,
                 provider_override: provider,
-                workdir: workdir
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or(std::env::current_dir()?),
+                workdir,
                 max_turns,
                 stream_output,
                 verbose: cli.verbose,
@@ -383,6 +394,7 @@ async fn main() -> Result<()> {
                 credentials: creds.to_hashmap(),
                 save_session: save_sessions,
                 previous_session,
+                security,
             };
             coding_agent::run(options).await?;
         }
@@ -400,7 +412,11 @@ async fn main() -> Result<()> {
         Some(Commands::Validate { dir }) => {
             validate::run(dir)?;
         }
-        Some(Commands::Tui { prompt, model }) => {
+        Some(Commands::Tui {
+            prompt,
+            model,
+            plugins_dir,
+        }) => {
             let previous_session =
                 load_requested_session(cli.session.as_deref(), cli.continue_session)?;
             let options = frontend::tui::options_from_config(
@@ -411,6 +427,8 @@ async fn main() -> Result<()> {
                 &creds,
                 save_sessions,
                 previous_session,
+                config.security.clone(),
+                plugins_dir.map(std::path::PathBuf::from),
             );
             frontend::tui::run(options).await?;
         }
@@ -432,6 +450,8 @@ async fn main() -> Result<()> {
                 &creds,
                 save_sessions,
                 previous_session,
+                config.security.clone(),
+                None,
             );
             frontend::tui::run(options).await?;
         }

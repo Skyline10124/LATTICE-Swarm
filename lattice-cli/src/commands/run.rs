@@ -3,14 +3,14 @@ use colored::Colorize;
 use lattice_agent::{
     default_tool_definitions,
     tool_registry::{ToolHandler, ToolRegistry},
-    Agent, DefaultToolExecutor, LoopEvent,
+    Agent, LoopEvent,
 };
 use lattice_bus::{AgentRegistry, Pipeline};
 use lattice_core::router::ModelRouter;
 use lattice_core::types::{Message, Role};
-use lattice_plugin::registry::PluginRegistry;
 use std::collections::HashMap;
 use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
 
 #[allow(clippy::too_many_arguments)]
@@ -27,6 +27,7 @@ pub async fn run(
     system_prompt: Option<&str>,
     max_turns: u32,
     stream_output: bool,
+    security: crate::security::RuntimeSecurity,
 ) -> Result<()> {
     // Dry-run: compile prompt through engine and print, no LLM call, no credential needed
     if dry_run {
@@ -51,11 +52,13 @@ pub async fn run(
     let resolved_provider = resolved.provider.clone();
 
     let tools = default_tool_definitions();
+    let executor = crate::security::build_tool_executor(Path::new("."), &security)?;
     let mut agent = Agent::new(resolved)
         .with_tools(tools)
-        .with_tool_executor(Box::new(
-            DefaultToolExecutor::new(".").map_err(anyhow::Error::msg)?,
-        ));
+        .with_tool_executor(Box::new(executor));
+    if let Some(ref audit) = security.audit {
+        agent = agent.with_audit(audit.clone());
+    }
     if let Some(session) = previous_session.as_ref() {
         agent.seed_messages(crate::session::messages_for_agent(session));
     }
@@ -89,6 +92,7 @@ pub async fn run(
         renderer.finish(Some(agent.token_usage()))?;
         events
     };
+    crate::security::reap_audit(&security).await;
     let content = extract_content(&events);
 
     if save {
@@ -276,19 +280,10 @@ pub async fn run_pipeline(
     let tool_registry = Arc::new(tool_registry);
 
     // Build PluginRegistry with official plugins plus optional local manifests.
-    let plugin_registry = Arc::new(PluginRegistry::new());
-    lattice_plugins::register_official_plugins(&plugin_registry)
-        .map_err(|e| anyhow::anyhow!("Failed to register official plugins: {}", e))?;
+    let plugin_dir = plugins_dir.map(std::path::PathBuf::from);
+    let plugin_registry = crate::plugins::build_plugin_registry(plugin_dir.as_deref())?;
     let mut _plugin_watcher = None;
-    if let Some(dir) = plugins_dir {
-        let plugin_dir = std::path::PathBuf::from(dir);
-        let bundles = lattice_plugin::watcher::load_registry_bundles(&plugin_dir, false)
-            .map_err(|e| anyhow::anyhow!("Failed to load plugins from '{}': {}", dir, e))?;
-        for bundle in bundles {
-            plugin_registry
-                .replace(bundle)
-                .map_err(|e| anyhow::anyhow!("Failed to register plugins: {}", e))?;
-        }
+    if let Some(plugin_dir) = plugin_dir {
         if plugin_dir.exists() {
             _plugin_watcher = Some(
                 lattice_plugin::watcher::PluginWatcher::spawn(

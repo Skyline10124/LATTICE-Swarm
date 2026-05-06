@@ -4,11 +4,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use colored::Colorize;
-use lattice_agent::{
-    default_tool_definitions, Agent, DefaultToolExecutor, LoopEvent, ToolExecutor,
-};
+use lattice_agent::{default_tool_definitions, Agent, LoopEvent, ToolExecutor};
 use lattice_core::router::ModelRouter;
 use lattice_core::types::{FunctionCall, Message, ToolCall};
+
+use crate::security::RuntimeSecurity;
 
 pub(crate) struct CodingAgentOptions {
     pub(crate) prompt: String,
@@ -22,6 +22,7 @@ pub(crate) struct CodingAgentOptions {
     pub(crate) credentials: HashMap<String, String>,
     pub(crate) save_session: bool,
     pub(crate) previous_session: Option<crate::session::Session>,
+    pub(crate) security: RuntimeSecurity,
 }
 
 pub(crate) struct CodingAgentBuildOptions {
@@ -32,6 +33,7 @@ pub(crate) struct CodingAgentBuildOptions {
     pub(crate) previous_session: Option<crate::session::Session>,
     pub(crate) prior_messages: Vec<Message>,
     pub(crate) thinking_effort: Option<String>,
+    pub(crate) security: RuntimeSecurity,
 }
 
 pub(crate) struct BuiltCodingAgent {
@@ -50,6 +52,7 @@ pub(crate) async fn run(options: CodingAgentOptions) -> Result<()> {
         previous_session: options.previous_session.clone(),
         prior_messages: Vec::new(),
         thinking_effort: None,
+        security: options.security.clone(),
     })?;
     let mut agent = built.agent;
     let resolved_model = built.model;
@@ -59,10 +62,11 @@ pub(crate) async fn run(options: CodingAgentOptions) -> Result<()> {
         eprintln!(
             "{}",
             format!(
-                "coding agent: {}@{} in {}",
+                "coding agent: {}@{} in {} (sandbox={})",
                 resolved_model,
                 resolved_provider,
-                options.workdir.display()
+                options.workdir.display(),
+                options.security.mode_label
             )
             .cyan()
         );
@@ -95,6 +99,7 @@ pub(crate) async fn run(options: CodingAgentOptions) -> Result<()> {
         renderer.finish(Some(agent.token_usage()))?;
         events
     };
+    crate::security::reap_audit(&options.security).await;
 
     if options.save_session {
         let content = extract_content(&events);
@@ -127,13 +132,14 @@ pub(crate) fn build_coding_agent(options: CodingAgentBuildOptions) -> Result<Bui
     } else {
         128000
     };
+    let executor = crate::security::build_tool_executor(&options.workdir, &options.security)?;
     let mut agent = Agent::new(resolved)
         .with_tools(default_tool_definitions())
-        .with_tool_executor(Box::new(
-            DefaultToolExecutor::new(options.workdir.to_string_lossy().as_ref())
-                .map_err(anyhow::Error::msg)?,
-        ))
+        .with_tool_executor(Box::new(executor))
         .with_thinking_effort(options.thinking_effort);
+    if let Some(ref audit) = options.security.audit {
+        agent = agent.with_audit(audit.clone());
+    }
     agent.set_system_prompt(&coding_system_prompt(&options.workdir));
     if !options.prior_messages.is_empty() {
         agent.seed_messages(options.prior_messages);
@@ -167,9 +173,12 @@ pub(crate) fn authenticated_providers(credentials: &HashMap<String, String>) -> 
     providers
 }
 
-pub(crate) async fn run_bash_tool(workdir: &Path, command: &str) -> Result<String> {
-    let executor =
-        DefaultToolExecutor::new(workdir.to_string_lossy().as_ref()).map_err(anyhow::Error::msg)?;
+pub(crate) async fn run_bash_tool(
+    workdir: &Path,
+    security: &RuntimeSecurity,
+    command: &str,
+) -> Result<String> {
+    let executor = crate::security::build_tool_executor(workdir, security)?;
     let call = ToolCall {
         id: "tui-bash".into(),
         function: FunctionCall {
@@ -189,7 +198,7 @@ fn resolve_model(
     Ok(router.resolve(model, provider_override)?)
 }
 
-fn coding_system_prompt(workdir: &Path) -> String {
+pub(crate) fn coding_system_prompt(workdir: &Path) -> String {
     let context = repo_context(workdir);
     format!(
         "You are LATTICE Swarm, a repo-aware coding agent.\n\

@@ -43,7 +43,7 @@ fn register_zone(app: &App, rect: (u16, u16, u16, u16), action: super::app::Clic
 }
 
 fn bottom_height(app: &App, suggestion_count: usize, terminal_height: u16) -> u16 {
-    let help: u16 = if app.help_open { 9 } else { 0 };
+    let help: u16 = if app.help_open { 10 } else { 0 };
     let suggestions = if suggestion_count > 0 {
         suggestion_count.min(6) as u16 + 2
     } else {
@@ -172,7 +172,20 @@ fn render_transcript(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     f.render_widget(Paragraph::new(Text::from(styled_rows)), viewport);
 
     if effective_scroll > 0 && pin_height == 0 {
-        let marker = format!("↑ {} lines above latest  End/click=jump", effective_scroll);
+        let marker = if app.search.is_active() {
+            match app.search.position() {
+                Some((current, total)) => format!(
+                    "find {current}/{total} · ↑ {} lines above latest  End/click=jump",
+                    effective_scroll
+                ),
+                None => format!(
+                    "find 0 · ↑ {} lines above latest  End/click=jump",
+                    effective_scroll
+                ),
+            }
+        } else {
+            format!("↑ {} lines above latest  End/click=jump", effective_scroll)
+        };
         let marker_area = Rect::new(area.x, area.y, area.width, 1);
         f.render_widget(
             Paragraph::new(Line::from(vec![
@@ -199,6 +212,8 @@ fn render_menu_overlay(f: &mut Frame, area: Rect, menu: &super::app::MenuState, 
     let title = match menu.kind {
         super::app::MenuKind::Model => " Select Model ",
         super::app::MenuKind::Provider => " Select Provider ",
+        super::app::MenuKind::Permissions => " Select Permissions ",
+        super::app::MenuKind::Plugin => " Select Plugin ",
     };
     let max_h = (menu.options.len() as u16 + 3).min(area.height.saturating_sub(4));
     let max_w = 50u16.min(area.width.saturating_sub(4));
@@ -311,7 +326,42 @@ fn truncate_to_width(s: &str, max_width: usize) -> String {
 fn transcript_lines(app: &App, theme: &Theme, width: u16) -> Vec<Line<'static>> {
     app.messages
         .iter()
-        .flat_map(|msg| message_lines(msg, theme, app.transcript_mode, width))
+        .enumerate()
+        .flat_map(|(idx, msg)| {
+            let mut lines = message_lines(msg, theme, app.transcript_mode, width);
+            if app.search.is_active() && app.search.matches.contains(&idx) {
+                let is_target = app.search.target_message == Some(idx);
+                lines = highlight_search_message(lines, theme, is_target);
+            }
+            lines
+        })
+        .collect()
+}
+
+fn highlight_search_message(
+    lines: Vec<Line<'static>>,
+    theme: &Theme,
+    is_target: bool,
+) -> Vec<Line<'static>> {
+    let style = if is_target {
+        Style::default().fg(theme.bg).bg(theme.highlight)
+    } else {
+        Style::default().bg(theme.surface)
+    };
+    lines
+        .into_iter()
+        .map(|line| {
+            if line.spans.is_empty() {
+                line
+            } else {
+                let spans = line
+                    .spans
+                    .into_iter()
+                    .map(|span| Span::styled(span.content.to_string(), span.style.patch(style)))
+                    .collect::<Vec<_>>();
+                Line::from(spans)
+            }
+        })
         .collect()
 }
 
@@ -381,6 +431,14 @@ fn render_welcome(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         format!("  model  {} @ {}", app.current_model.as_str(), provider),
         Style::default().fg(theme.subtext),
     )]));
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            "  runtime  sandbox:{} · plugins:{}",
+            app.security.mode_label,
+            app.plugin_count()
+        ),
+        Style::default().fg(theme.subtext),
+    )]));
     if let Some(ref e) = app.thinking_effort {
         lines.push(Line::from(vec![Span::styled(
             format!("  effort  {}", e),
@@ -412,13 +470,15 @@ fn welcome_tip() -> &'static str {
         let tips = [
             "Type / to see all available commands.",
             "Use ! before a command to run it in bash (e.g. !ls).",
-            "Ctrl+O toggles the thinking trace view.",
+            "Ctrl+O expands or collapses the latest thinking block.",
             "Ctrl+E expands collapsed tool outputs.",
             "Ctrl+Y copies the last assistant response.",
             "Click and drag to select text — auto-copied.",
             "Use /effort <level> to control thinking depth.",
             "Up/Down arrows navigate input history.",
             "/model <name> switches the LLM for the next turn.",
+            "/permissions switches the runtime sandbox for later turns.",
+            "/plugins lists loaded official and local runtime plugins.",
         ];
         let ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -436,7 +496,7 @@ fn render_welcome_shortcuts(theme: &Theme) -> Vec<Line<'static>> {
         ("/commands", "slash command menu"),
         ("Ctrl+N", "new session"),
         ("Ctrl+L", "clear transcript"),
-        ("Ctrl+O", "toggle trace"),
+        ("Ctrl+O", "thinking"),
         ("Ctrl+E", "expand tool output"),
         ("Ctrl+Y", "copy last response"),
         ("Ctrl+C", "quit"),
@@ -482,7 +542,7 @@ fn render_bottom(
         render_help(f, chunks[0], theme);
     }
     if suggestion_height > 0 {
-        render_suggestions(f, chunks[1], suggestions, theme);
+        render_suggestions(f, chunks[1], suggestions, app.suggestion_index, theme);
     }
     render_composer(f, chunks[2], app, theme);
     Statusline::new(*theme).render(chunks[3], f.buffer_mut(), app);
@@ -505,11 +565,13 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
 
     let rows = vec![
         help_row("Enter", "send", "Shift+Enter", "newline", theme),
-        help_row("?", "toggle help", "/", "commands", theme),
+        help_row("?", "toggle help", "Tab", "complete cmd", theme),
         help_row("Ctrl+N", "new session", "Ctrl+L", "clear transcript", theme),
-        help_row("Ctrl+O", "toggle trace", "Ctrl+E", "expand tool", theme),
+        help_row("Ctrl+F", "find", "Ctrl+G", "next match", theme),
+        help_row("Ctrl+O", "thinking", "Ctrl+E", "expand tool", theme),
+        help_row("/permissions", "sandbox", "/plugins", "plugins", theme),
         help_row("Esc", "clear/close", "End", "jump bottom", theme),
-        help_row("↑/↓", "scroll", "Ctrl+C", "quit", theme),
+        help_row("↑/↓", "scroll/history", "Ctrl+C", "quit", theme),
     ];
 
     f.render_widget(Paragraph::new(Text::from(rows)), inner);
@@ -539,7 +601,13 @@ fn help_row<'a>(
     ])
 }
 
-fn render_suggestions(f: &mut Frame, area: Rect, suggestions: &[SlashSuggestion], theme: &Theme) {
+fn render_suggestions(
+    f: &mut Frame,
+    area: Rect,
+    suggestions: &[SlashSuggestion],
+    selected_index: usize,
+    theme: &Theme,
+) {
     if area.height == 0 {
         return;
     }
@@ -555,15 +623,28 @@ fn render_suggestions(f: &mut Frame, area: Rect, suggestions: &[SlashSuggestion]
     let lines = suggestions
         .iter()
         .take(inner.height as usize)
-        .map(|suggestion| {
+        .enumerate()
+        .map(|(idx, suggestion)| {
+            let selected = idx == selected_index.min(suggestions.len().saturating_sub(1));
+            let marker = if selected { "▶ " } else { "  " };
+            let command_style = if selected {
+                Style::default()
+                    .fg(theme.bg)
+                    .bg(theme.highlight)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(theme.highlight)
+                    .add_modifier(Modifier::BOLD)
+            };
+            let desc_style = if selected {
+                Style::default().fg(theme.bg).bg(theme.highlight)
+            } else {
+                Style::default().fg(theme.subtext)
+            };
             Line::from(vec![
-                Span::styled(
-                    format!("{:<15}", suggestion.command),
-                    Style::default()
-                        .fg(theme.highlight)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(suggestion.description, Style::default().fg(theme.subtext)),
+                Span::styled(format!("{marker}{:<15}", suggestion.command), command_style),
+                Span::styled(suggestion.description, desc_style),
             ])
         })
         .collect::<Vec<_>>();
@@ -588,13 +669,18 @@ fn render_composer(f: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         return;
     }
 
+    let placeholder = if app.status == super::app::AppStatus::Streaming {
+        "Type now to queue the next prompt"
+    } else if app.search.is_active() {
+        "Esc clears search · /next and /prev navigate matches"
+    } else {
+        "Type a message or / for commands"
+    };
+
     let input = if app.input.is_empty() {
         Text::from(Line::from(vec![
             Span::styled(PROMPT_PREFIX, Style::default().fg(theme.subtext)),
-            Span::styled(
-                "Type a message or / for commands",
-                Style::default().fg(theme.subtext),
-            ),
+            Span::styled(placeholder, Style::default().fg(theme.subtext)),
         ]))
     } else {
         prefixed_input(&app.input, theme)

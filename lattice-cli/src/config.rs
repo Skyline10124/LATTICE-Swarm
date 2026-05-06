@@ -15,6 +15,9 @@ pub struct Config {
     pub ui: UiConfig,
 
     #[serde(default)]
+    pub security: SecurityConfig,
+
+    #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
 }
 
@@ -42,11 +45,37 @@ pub struct ProviderConfig {
     pub base_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SecurityConfig {
+    #[serde(default = "default_sandbox_mode")]
+    pub sandbox_mode: String,
+    #[serde(default)]
+    pub read_allowlist: Vec<String>,
+    #[serde(default)]
+    pub write_allowlist: Vec<String>,
+    #[serde(default)]
+    pub command_allowlist: Vec<String>,
+    #[serde(default = "default_true")]
+    pub hook_chain: bool,
+    #[serde(default)]
+    pub landlock: bool,
+    #[serde(default)]
+    pub audit: bool,
+    pub audit_dir: Option<String>,
+    pub max_command_timeout: Option<u32>,
+    pub max_read_size: Option<usize>,
+    pub max_write_size: Option<usize>,
+    pub max_http_response_size: Option<usize>,
+}
+
 fn default_model() -> String {
     "sonnet".into()
 }
 fn default_theme() -> String {
     "dark".into()
+}
+fn default_sandbox_mode() -> String {
+    "project".into()
 }
 fn default_true() -> bool {
     true
@@ -87,7 +116,27 @@ impl Default for Config {
             path,
             core: Default::default(),
             ui: Default::default(),
+            security: Default::default(),
             providers: Default::default(),
+        }
+    }
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            sandbox_mode: default_sandbox_mode(),
+            read_allowlist: vec![],
+            write_allowlist: vec![],
+            command_allowlist: vec![],
+            hook_chain: true,
+            landlock: false,
+            audit: false,
+            audit_dir: None,
+            max_command_timeout: None,
+            max_read_size: None,
+            max_write_size: None,
+            max_http_response_size: None,
         }
     }
 }
