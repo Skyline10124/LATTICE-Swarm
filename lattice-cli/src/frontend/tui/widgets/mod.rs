@@ -1,2 +1,2 @@
-pub mod message;
-pub mod statusline;
+pub(super) mod message;
+pub(super) mod statusline;

@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
+use base64::Engine as _;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-use lattice_agent::{default_tool_definitions, Agent, DefaultToolExecutor, LoopEvent};
-use lattice_core::router::ModelRouter;
+use lattice_agent::{Agent, LoopEvent};
 use lattice_core::types::Role;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
+
+use crate::coding_agent::{self, CodingAgentBuildOptions};
 
 use super::event::Event;
 
@@ -98,11 +100,11 @@ fn dispatch_loop_event(
 }
 
 /// A single message in the chat.
-pub struct ChatMessage {
-    pub role: Role,
-    pub content: String,
-    pub reasoning: Option<String>,
-    pub collapsed: bool,
+pub(super) struct ChatMessage {
+    pub(super) role: Role,
+    pub(super) content: String,
+    pub(super) reasoning: Option<String>,
+    pub(super) collapsed: bool,
     cached_lines:
         std::cell::RefCell<Option<(usize, std::sync::Arc<Vec<ratatui::text::Line<'static>>>)>>,
     cached_width: std::cell::Cell<Option<u16>>,
@@ -133,7 +135,7 @@ impl std::fmt::Debug for ChatMessage {
 }
 
 impl ChatMessage {
-    pub fn new(role: Role, content: String) -> Self {
+    pub(super) fn new(role: Role, content: String) -> Self {
         Self {
             role,
             content,
@@ -144,7 +146,7 @@ impl ChatMessage {
         }
     }
 
-    pub fn set_cache(
+    pub(super) fn set_cache(
         &self,
         content_len: usize,
         lines: Vec<ratatui::text::Line<'static>>,
@@ -155,7 +157,7 @@ impl ChatMessage {
         self.cached_width.set(Some(width));
     }
 
-    pub fn get_cache(
+    pub(super) fn get_cache(
         &self,
         content_len: usize,
         width: u16,
@@ -170,18 +172,13 @@ impl ChatMessage {
             None
         }
     }
-
-    pub fn clear_cache(&self) {
-        self.cached_lines.replace(None);
-        self.cached_width.set(None);
-    }
 }
 
 /// Send text to the terminal clipboard via OSC 52.
 /// Works in most modern terminals (kitty, wezterm, foot, iterm2, windows terminal).
 fn write_osc52_clipboard(text: &str) {
     use std::io::Write;
-    let encoded = base64_encode(text);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
     let osc = format!("\x1b]52;c;{}\x07", encoded);
     let _ = std::io::stdout().write_all(osc.as_bytes());
     let _ = std::io::stdout().flush();
@@ -189,35 +186,10 @@ fn write_osc52_clipboard(text: &str) {
 
 type ClipboardSink = Arc<dyn Fn(&str) + Send + Sync>;
 
-fn base64_encode(input: &str) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let bytes = input.as_bytes();
-    let mut result = String::new();
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        result.push(CHARS[((triple >> 18) & 0x3f) as usize] as char);
-        result.push(CHARS[((triple >> 12) & 0x3f) as usize] as char);
-        if chunk.len() > 1 {
-            result.push(CHARS[((triple >> 6) & 0x3f) as usize] as char);
-        } else {
-            result.push('=');
-        }
-        if chunk.len() > 2 {
-            result.push(CHARS[(triple & 0x3f) as usize] as char);
-        } else {
-            result.push('=');
-        }
-    }
-    result
-}
-
 #[derive(Debug, Clone, Copy)]
-pub struct SlashSuggestion {
-    pub command: &'static str,
-    pub description: &'static str,
+pub(super) struct SlashSuggestion {
+    pub(super) command: &'static str,
+    pub(super) description: &'static str,
 }
 
 const SLASH_COMMANDS: &[SlashSuggestion] = &[
@@ -280,89 +252,90 @@ const SLASH_COMMANDS: &[SlashSuggestion] = &[
 ];
 
 /// Application state.
-pub struct App {
-    pub should_quit: bool,
-    pub messages: Vec<ChatMessage>,
-    pub input: String,
-    pub input_cursor: usize,
-    pub status: AppStatus,
-    pub current_model: String,
-    pub previous_model: String,
-    pub current_provider: String,
-    pub token_count: usize,
-    pub scroll_offset: usize,
-    pub help_open: bool,
-    pub transcript_mode: bool,
-    pub spinner_index: usize,
-    pub provider_override: Option<String>,
-    pub credentials: HashMap<String, String>,
-    pub save_sessions: bool,
-    pub session: Option<crate::session::Session>,
-    pub pending_user: Option<String>,
-    pub event_tx: Option<UnboundedSender<Event>>,
-    pub agent: Option<Arc<Mutex<Agent>>>,
-    pub active_turn_id: Option<u64>,
-    pub next_turn_id: u64,
-    pub active_assistant_index: Option<usize>,
+pub(super) struct App {
+    pub(super) should_quit: bool,
+    pub(super) messages: Vec<ChatMessage>,
+    pub(super) input: String,
+    pub(super) input_cursor: usize,
+    pub(super) status: AppStatus,
+    pub(super) current_model: String,
+    pub(super) previous_model: String,
+    pub(super) current_provider: String,
+    pub(super) token_count: usize,
+    pub(super) scroll_offset: usize,
+    pub(super) help_open: bool,
+    pub(super) transcript_mode: bool,
+    pub(super) spinner_index: usize,
+    pub(super) provider_override: Option<String>,
+    pub(super) credentials: HashMap<String, String>,
+    pub(super) workdir: std::path::PathBuf,
+    pub(super) save_sessions: bool,
+    pub(super) session: Option<crate::session::Session>,
+    pub(super) pending_user: Option<String>,
+    pub(super) event_tx: Option<UnboundedSender<Event>>,
+    pub(super) agent: Option<Arc<Mutex<Agent>>>,
+    pub(super) active_turn_id: Option<u64>,
+    pub(super) next_turn_id: u64,
+    pub(super) active_assistant_index: Option<usize>,
     input_history: Vec<String>,
     history_index: Option<usize>,
     draft_before_history: String,
-    pub click_zones: std::cell::RefCell<Vec<ClickZone>>,
-    pub stream_started: Option<std::time::Instant>,
-    pub reasoning_started: Option<std::time::Instant>,
-    pub reasoning_duration: Option<std::time::Duration>,
-    pub thinking_effort: Option<String>,
-    pub context_limit: u32,
-    pub selection: Option<TextSelection>,
+    pub(super) click_zones: std::cell::RefCell<Vec<ClickZone>>,
+    pub(super) stream_started: Option<std::time::Instant>,
+    pub(super) reasoning_started: Option<std::time::Instant>,
+    pub(super) reasoning_duration: Option<std::time::Duration>,
+    pub(super) thinking_effort: Option<String>,
+    pub(super) context_limit: u32,
+    pub(super) selection: Option<TextSelection>,
     /// Text of each visible transcript row (populated during render, used for copy-on-select)
-    pub visible_rows: std::cell::RefCell<Vec<String>>,
-    pub visible_rows_origin: std::cell::Cell<u16>,
-    pub menu: Option<MenuState>,
+    pub(super) visible_rows: std::cell::RefCell<Vec<String>>,
+    pub(super) visible_rows_origin: std::cell::Cell<u16>,
+    pub(super) menu: Option<MenuState>,
     clipboard: ClipboardSink,
 }
 
 #[derive(Debug, Clone)]
-pub struct MenuState {
-    pub kind: MenuKind,
-    pub options: Vec<String>,
-    pub index: usize,
+pub(super) struct MenuState {
+    pub(super) kind: MenuKind,
+    pub(super) options: Vec<String>,
+    pub(super) index: usize,
 }
 
 #[derive(Debug, Clone)]
-pub enum MenuKind {
+pub(super) enum MenuKind {
     Model,
     Provider,
 }
 
 #[derive(Debug, Clone)]
-pub struct TextSelection {
-    pub start_row: u16,
-    pub start_col: u16,
-    pub end_row: u16,
-    pub end_col: u16,
-    pub active: bool, // true while mouse button held
+pub(super) struct TextSelection {
+    pub(super) start_row: u16,
+    pub(super) start_col: u16,
+    pub(super) end_row: u16,
+    pub(super) end_col: u16,
+    pub(super) active: bool, // true while mouse button held
 }
 
 #[derive(Debug, Clone)]
-pub struct ClickZone {
-    pub rect: (u16, u16, u16, u16), // x, y, w, h
-    pub action: ClickAction,
+pub(super) struct ClickZone {
+    pub(super) rect: (u16, u16, u16, u16), // x, y, w, h
+    pub(super) action: ClickAction,
 }
 
 #[derive(Debug, Clone)]
-pub enum ClickAction {
+pub(super) enum ClickAction {
     JumpToBottom,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum AppStatus {
+pub(super) enum AppStatus {
     Ready,
     Streaming,
     Error(String),
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             should_quit: false,
             messages: vec![],
@@ -379,6 +352,7 @@ impl App {
             spinner_index: 0,
             provider_override: None,
             credentials: HashMap::new(),
+            workdir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             save_sessions: false,
             session: None,
             pending_user: None,
@@ -404,7 +378,7 @@ impl App {
         }
     }
 
-    pub fn load_session(&mut self, session: crate::session::Session) {
+    pub(super) fn load_session(&mut self, session: crate::session::Session) {
         self.cancel_active_turn();
         self.messages = session
             .messages
@@ -413,6 +387,8 @@ impl App {
             .collect();
         self.current_provider = session.provider.clone();
         self.session = Some(session);
+        self.agent = None;
+        self.previous_model.clear();
         self.scroll_offset = 0;
     }
 
@@ -437,7 +413,7 @@ impl App {
         self.reasoning_duration = None;
     }
 
-    pub fn accepts_turn(&self, turn_id: u64) -> bool {
+    pub(super) fn accepts_turn(&self, turn_id: u64) -> bool {
         self.active_turn_id == Some(turn_id)
     }
 
@@ -450,11 +426,11 @@ impl App {
         (self.clipboard)(text);
     }
 
-    pub fn tick(&mut self) {
+    pub(super) fn tick(&mut self) {
         self.spinner_index = self.spinner_index.wrapping_add(1);
     }
 
-    pub async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+    pub(super) async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         // Menu navigation: intercept when menu is open
         if self.menu.is_some() {
             match key.code {
@@ -615,7 +591,7 @@ impl App {
     }
 
     /// Insert text at the cursor (e.g. from paste or IME commit).
-    pub fn insert_text(&mut self, text: &str) {
+    pub(super) fn insert_text(&mut self, text: &str) {
         self.exit_history_mode();
         for c in text.chars() {
             self.input.insert(self.input_cursor, c);
@@ -671,7 +647,7 @@ impl App {
         }
     }
 
-    pub async fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
+    pub(super) async fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
         if self.menu.is_some() {
             return Ok(());
         }
@@ -790,31 +766,10 @@ impl App {
             self.status = AppStatus::Streaming;
             self.stream_started = Some(std::time::Instant::now());
 
-            let output = match tokio::process::Command::new("bash")
-                .arg("-c")
-                .arg(cmd)
-                .output()
-                .await
-            {
-                Ok(out) => {
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let mut result = String::new();
-                    if !stdout.is_empty() {
-                        result.push_str(stdout.trim());
-                    }
-                    if !stderr.is_empty() {
-                        if !result.is_empty() {
-                            result.push('\n');
-                        }
-                        result.push_str(&format!("[stderr]\n{}", stderr.trim()));
-                    }
-                    if result.is_empty() {
-                        result = format!("(exit: {})", out.status.code().unwrap_or(-1));
-                    }
-                    result
-                }
-                Err(e) => format!("bash: {e}"),
+            let output = match coding_agent::run_bash_tool(&self.workdir, cmd).await {
+                Ok(output) if output.trim().is_empty() => "(no output)".to_string(),
+                Ok(output) => output.trim().to_string(),
+                Err(err) => format!("bash: {err}"),
             };
 
             let collapsed = output.lines().count() > 6;
@@ -852,12 +807,10 @@ impl App {
             }
         };
 
-        // --- Rebuild agent if none exists or model changed ---
+        // Rebuild agent if none exists or model changed.
         let needs_rebuild = self.agent.is_none() || self.current_model != self.previous_model;
 
         if needs_rebuild {
-            // Preserve conversation history from the old agent on rebuild
-            // (e.g. model switch) so the new model sees prior turns.
             let prior_messages = if let Some(arc) = self.agent.as_ref() {
                 let agent = arc.lock().await;
                 agent.messages().to_vec()
@@ -865,61 +818,44 @@ impl App {
                 vec![]
             };
 
-            let model = self.current_model.clone();
-            let provider_override = self.provider_override.clone();
-            let credentials = self.credentials.clone();
-            let resolved = match tokio::task::spawn_blocking(move || {
-                let router = ModelRouter::with_credentials(credentials);
-                router.resolve(&model, provider_override.as_deref())
+            let build_options = CodingAgentBuildOptions {
+                model: self.current_model.clone(),
+                provider_override: self.provider_override.clone(),
+                workdir: self.workdir.clone(),
+                credentials: self.credentials.clone(),
+                previous_session: self.session.clone(),
+                prior_messages,
+                thinking_effort: self.thinking_effort.clone(),
+            };
+
+            let built = match tokio::task::spawn_blocking(move || {
+                coding_agent::build_coding_agent(build_options)
             })
             .await
             {
-                Ok(Ok(r)) => r,
+                Ok(Ok(built)) => built,
                 Ok(Err(e)) => {
-                    let _ = tx.send(pack_error(turn_id, format!("resolve failed: {e}")));
+                    let _ = tx.send(pack_error(turn_id, format!("agent build failed: {e}")));
                     self.status = AppStatus::Ready;
                     return Ok(());
                 }
                 Err(_) => {
-                    let _ = tx.send(pack_error(turn_id, "resolve task panicked".into()));
+                    let _ = tx.send(pack_error(turn_id, "agent build task panicked".into()));
                     self.status = AppStatus::Ready;
                     return Ok(());
                 }
             };
 
-            // Report resolved model info
-            self.context_limit = if resolved.context_length > 0 {
-                resolved.context_length
-            } else {
-                128000
-            };
+            self.context_limit = built.context_limit;
+            self.current_model = built.model.clone();
+            self.current_provider = built.provider.clone();
             let _ = tx.send(Event::ModelInfo {
                 turn_id,
-                model: resolved.canonical_id.clone(),
-                provider: resolved.provider.clone(),
+                model: built.model.clone(),
+                provider: built.provider.clone(),
             });
 
-            let executor = match DefaultToolExecutor::new(".").map_err(|e| anyhow!(e)) {
-                Ok(executor) => executor,
-                Err(e) => {
-                    let _ = tx.send(pack_error(turn_id, format!("tool executor failed: {e}")));
-                    self.status = AppStatus::Ready;
-                    return Ok(());
-                }
-            };
-            let mut agent = Agent::new(resolved)
-                .with_tools(default_tool_definitions())
-                .with_tool_executor(Box::new(executor))
-                .with_thinking_effort(self.thinking_effort.clone());
-            agent.set_system_prompt("You are a helpful assistant.");
-            // Prefer full agent history over lossy session messages.
-            // prior_messages includes tool calls/results that session omits.
-            if !prior_messages.is_empty() {
-                agent.seed_messages(prior_messages);
-            } else if let Some(session) = self.session.as_ref() {
-                agent.seed_messages(crate::session::messages_for_agent(session));
-            }
-            self.agent = Some(Arc::new(Mutex::new(agent)));
+            self.agent = Some(Arc::new(Mutex::new(built.agent)));
             self.previous_model = self.current_model.clone();
         }
 
@@ -979,10 +915,7 @@ impl App {
             "/model" => {
                 let model = parts.collect::<Vec<_>>().join(" ");
                 if model.is_empty() {
-                    let router = lattice_core::router::ModelRouter::with_credentials(
-                        self.credentials.clone(),
-                    );
-                    let models = router.list_authenticated_models();
+                    let models = coding_agent::authenticated_models(&self.credentials);
                     let idx = models
                         .iter()
                         .position(|m| *m == self.current_model)
@@ -1022,20 +955,7 @@ impl App {
             "/provider" => {
                 let arg = parts.collect::<Vec<_>>().join(" ");
                 if arg.is_empty() {
-                    let router = lattice_core::router::ModelRouter::with_credentials(
-                        self.credentials.clone(),
-                    );
-                    // Collect unique providers from authenticated models
-                    let mut providers: Vec<String> = Vec::new();
-                    let mut seen = std::collections::BTreeSet::new();
-                    for model in router.list_authenticated_models() {
-                        // Parse model string to extract provider
-                        if let Some((provider, _)) = model.split_once('/') {
-                            if seen.insert(provider.to_string()) {
-                                providers.push(provider.to_string());
-                            }
-                        }
-                    }
+                    let providers = coding_agent::authenticated_providers(&self.credentials);
                     if providers.is_empty() {
                         let p = if self.current_provider.is_empty() {
                             "auto"
@@ -1264,7 +1184,7 @@ impl App {
             .push(ChatMessage::new(Role::System, content.to_string()));
     }
 
-    pub fn slash_suggestions(&self) -> Vec<SlashSuggestion> {
+    pub(super) fn slash_suggestions(&self) -> Vec<SlashSuggestion> {
         let Some(query) = self.input.strip_prefix('/') else {
             return Vec::new();
         };
@@ -1280,7 +1200,7 @@ impl App {
             .collect()
     }
 
-    pub fn mode_label(&self) -> &'static str {
+    pub(super) fn mode_label(&self) -> &'static str {
         if self.input.starts_with('!') {
             "bash"
         } else {
@@ -1288,13 +1208,13 @@ impl App {
         }
     }
 
-    pub fn spinner(&self) -> &'static str {
+    pub(super) fn spinner(&self) -> &'static str {
         const FRAMES: &[&str] = &["-", "\\", "|", "/"];
         FRAMES[self.spinner_index % FRAMES.len()]
     }
 
     /// Apply a streaming token to the last assistant message.
-    pub fn apply_stream_token(
+    pub(super) fn apply_stream_token(
         &mut self,
         turn_id: u64,
         content: String,
@@ -1391,7 +1311,7 @@ impl App {
         }
     }
 
-    pub fn apply_tool_output(
+    pub(super) fn apply_tool_output(
         &mut self,
         turn_id: u64,
         name: String,
@@ -1431,11 +1351,10 @@ impl App {
         self.scroll_offset = 0;
     }
 
-    pub fn toggle_tool_expand(&mut self) {
+    pub(super) fn toggle_tool_expand(&mut self) {
         if let Some(last) = self.messages.last_mut() {
             if last.role == Role::Tool {
                 last.collapsed = !last.collapsed;
-                last.clear_cache();
             }
         }
     }
@@ -1452,7 +1371,7 @@ impl App {
         self.token_count = total;
     }
 
-    pub fn copy_last_assistant(&mut self) {
+    pub(super) fn copy_last_assistant(&mut self) {
         let text = self
             .messages
             .iter()
@@ -1707,11 +1626,14 @@ mod tests {
     fn loading_session_does_not_override_explicit_model() {
         let mut app = App::new();
         app.current_model = "explicit-model".into();
+        app.previous_model = "old-agent-model".into();
 
         app.load_session(test_session());
 
         assert_eq!(app.current_model, "explicit-model");
         assert_eq!(app.current_provider, "old-provider");
         assert_eq!(app.messages.len(), 2);
+        assert!(app.previous_model.is_empty());
+        assert!(app.agent.is_none());
     }
 }

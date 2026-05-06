@@ -60,7 +60,7 @@ fn has_markdown_syntax(s: &str) -> bool {
     false
 }
 
-pub fn render_markdown(content: &str, theme: &Theme, width: u16) -> Vec<Line<'static>> {
+pub(super) fn render_markdown(content: &str, theme: &Theme, width: u16) -> Vec<Line<'static>> {
     if !has_markdown_syntax(content) {
         return render_plain_text(content, theme, width);
     }

@@ -9,16 +9,21 @@ use unicode_width::UnicodeWidthStr;
 use super::super::app::{App, AppStatus};
 use super::super::theme::Theme;
 
-pub struct Statusline {
+pub(in crate::frontend::tui) struct Statusline {
     theme: Theme,
 }
 
 impl Statusline {
-    pub fn new(theme: Theme) -> Self {
+    pub(in crate::frontend::tui) fn new(theme: Theme) -> Self {
         Self { theme }
     }
 
-    pub fn render(&self, area: Rect, buf: &mut ratatui::buffer::Buffer, app: &App) {
+    pub(in crate::frontend::tui) fn render(
+        &self,
+        area: Rect,
+        buf: &mut ratatui::buffer::Buffer,
+        app: &App,
+    ) {
         if area.height == 0 {
             return;
         }

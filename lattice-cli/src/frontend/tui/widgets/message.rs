@@ -8,7 +8,7 @@ use super::super::app::ChatMessage;
 use super::super::markdown::render_markdown;
 use super::super::theme::Theme;
 
-pub fn message_lines(
+pub(in crate::frontend::tui) fn message_lines(
     msg: &ChatMessage,
     theme: &Theme,
     transcript_mode: bool,

@@ -2,7 +2,7 @@ use crossterm::event::{self, Event as CEvent, KeyEvent, MouseEvent};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-pub enum Event {
+pub(super) enum Event {
     Tick,
     Key(KeyEvent),
     Mouse(MouseEvent),
@@ -31,13 +31,13 @@ pub enum Event {
     },
 }
 
-pub struct EventHandler {
+pub(super) struct EventHandler {
     rx: mpsc::UnboundedReceiver<Event>,
     _tx: mpsc::UnboundedSender<Event>,
 }
 
 impl EventHandler {
-    pub fn new(tick_rate: u64) -> Self {
+    pub(super) fn new(tick_rate: u64) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let tx_clone = tx.clone();
         let tick = Duration::from_millis(tick_rate);
@@ -77,11 +77,11 @@ impl EventHandler {
         EventHandler { rx, _tx: tx }
     }
 
-    pub async fn next(&mut self) -> Option<Event> {
+    pub(super) async fn next(&mut self) -> Option<Event> {
         self.rx.recv().await
     }
 
-    pub fn sender(&self) -> mpsc::UnboundedSender<Event> {
+    pub(super) fn sender(&self) -> mpsc::UnboundedSender<Event> {
         self._tx.clone()
     }
 }

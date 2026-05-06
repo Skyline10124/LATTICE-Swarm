@@ -36,16 +36,17 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub struct TuiOptions {
-    pub prompt: Option<String>,
-    pub model: String,
-    pub provider_override: Option<String>,
-    pub credentials: std::collections::HashMap<String, String>,
-    pub save_sessions: bool,
-    pub previous_session: Option<crate::session::Session>,
+pub(crate) struct TuiOptions {
+    pub(crate) prompt: Option<String>,
+    pub(crate) model: String,
+    pub(crate) provider_override: Option<String>,
+    pub(crate) workdir: std::path::PathBuf,
+    pub(crate) credentials: std::collections::HashMap<String, String>,
+    pub(crate) save_sessions: bool,
+    pub(crate) previous_session: Option<crate::session::Session>,
 }
 
-pub async fn run(options: TuiOptions) -> Result<()> {
+pub(crate) async fn run(options: TuiOptions) -> Result<()> {
     terminal::enable_raw_mode()?;
     let _guard = TerminalGuard;
     let mut stdout = io::stdout();
@@ -61,6 +62,7 @@ pub async fn run(options: TuiOptions) -> Result<()> {
     let mut app = App::new();
     app.current_model = options.model;
     app.provider_override = options.provider_override;
+    app.workdir = options.workdir;
     app.credentials = options.credentials;
     app.save_sessions = options.save_sessions;
     if let Some(session) = options.previous_session {
@@ -91,7 +93,7 @@ pub async fn run(options: TuiOptions) -> Result<()> {
     Ok(())
 }
 
-pub fn options_from_config(
+pub(crate) fn options_from_config(
     prompt: Option<String>,
     model: Option<String>,
     provider_override: Option<String>,
@@ -112,6 +114,7 @@ pub fn options_from_config(
         prompt,
         model,
         provider_override,
+        workdir: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
         credentials: creds.to_hashmap(),
         save_sessions,
         previous_session,

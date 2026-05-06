@@ -13,7 +13,7 @@ use super::widgets::{message::message_lines, statusline::Statusline};
 
 const PROMPT_PREFIX: &str = "❯ ";
 
-pub fn draw(f: &mut Frame, app: &App) {
+pub(super) fn draw(f: &mut Frame, app: &App) {
     let theme = Theme::catppuccin_mocha();
     let size = f.area();
     f.render_widget(Clear, size);
