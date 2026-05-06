@@ -1493,6 +1493,7 @@ dependencies = [
 [[package]]
 name = "lattice-agent"
 version = "0.1.0"
+source = "git+https://github.com/Skyline10124/LATTICE-Runtime.git?branch=main#3fd8ed2771992fcb5f1e9af25a674bcd1c8aa780"
 dependencies = [
  "async-trait",
  "futures",
@@ -1516,6 +1517,7 @@ dependencies = [
 [[package]]
 name = "lattice-bus"
 version = "0.1.0"
+source = "git+https://github.com/Skyline10124/LATTICE-Runtime.git?branch=main#3fd8ed2771992fcb5f1e9af25a674bcd1c8aa780"
 dependencies = [
  "async-trait",
  "blake3",
@@ -1569,6 +1571,7 @@ dependencies = [
 [[package]]
 name = "lattice-core"
 version = "0.1.0"
+source = "git+https://github.com/Skyline10124/LATTICE-Runtime.git?branch=main#3fd8ed2771992fcb5f1e9af25a674bcd1c8aa780"
 dependencies = [
  "chrono",
  "futures",
@@ -1590,6 +1593,7 @@ dependencies = [
 [[package]]
 name = "lattice-plugin"
 version = "0.1.0"
+source = "git+https://github.com/Skyline10124/LATTICE-Runtime.git?branch=main#3fd8ed2771992fcb5f1e9af25a674bcd1c8aa780"
 dependencies = [
  "async-trait",
  "lattice-agent",
@@ -1606,6 +1610,7 @@ dependencies = [
 [[package]]
 name = "lattice-plugins"
 version = "0.1.0"
+source = "git+https://github.com/Skyline10124/LATTICE-Plugins.git?branch=main#1074bd5202d2568e384f1eaeef520c180ae5d6e7"
 dependencies = [
  "lattice-core",
  "lattice-plugin",
