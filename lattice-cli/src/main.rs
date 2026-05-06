@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod coding_agent;
 mod commands;
 mod config;
 mod credentials;
@@ -134,6 +135,29 @@ enum Commands {
             overrides_with = "stream",
             help = "Print only after the run completes"
         )]
+        no_stream: bool,
+    },
+    #[command(about = "Launch the coding agent for repo-aware implementation work")]
+    Code {
+        #[arg(help = "Task for the coding agent, or use --file")]
+        prompt: Option<String>,
+        #[arg(short = 'f', long = "file", help = "Read task text from a file")]
+        file: Option<String>,
+        #[arg(short, long, help = "Model alias or canonical ID")]
+        model: Option<String>,
+        #[arg(long, help = "Provider override")]
+        provider: Option<String>,
+        #[arg(long, help = "Working directory for file tools and repo context")]
+        workdir: Option<String>,
+        #[arg(long, default_value_t = 20, help = "Maximum agent turns")]
+        max_turns: u32,
+        #[arg(
+            long,
+            overrides_with = "no_stream",
+            help = "Stream tokens as they arrive"
+        )]
+        stream: bool,
+        #[arg(long, overrides_with = "stream", help = "Print only after completion")]
         no_stream: bool,
     },
     #[command(about = "Debug mode: trace-level logging with colored output")]
@@ -319,6 +343,49 @@ async fn main() -> Result<()> {
                 .await?;
             }
         }
+        Some(Commands::Code {
+            prompt,
+            file,
+            model,
+            provider,
+            workdir,
+            max_turns,
+            stream,
+            no_stream,
+        }) => {
+            let prompt = load_run_prompt(prompt, file.as_deref())?;
+            let model = model
+                .or_else(|| cli.model.clone())
+                .unwrap_or_else(|| config.default_model());
+            let provider = provider.or_else(|| cli.provider.clone());
+            let previous_session =
+                load_requested_session(cli.session.as_deref(), cli.continue_session)?;
+            let stream_output = if cli.json {
+                false
+            } else if stream {
+                true
+            } else if no_stream {
+                false
+            } else {
+                config.core.stream
+            };
+            let options = coding_agent::CodingAgentOptions {
+                prompt,
+                model,
+                provider_override: provider,
+                workdir: workdir
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or(std::env::current_dir()?),
+                max_turns,
+                stream_output,
+                verbose: cli.verbose,
+                json: cli.json,
+                credentials: creds.to_hashmap(),
+                save_session: save_sessions,
+                previous_session,
+            };
+            coding_agent::run(options).await?;
+        }
         Some(Commands::Debug {
             prompt,
             model,
@@ -336,17 +403,16 @@ async fn main() -> Result<()> {
         Some(Commands::Tui { prompt, model }) => {
             let previous_session =
                 load_requested_session(cli.session.as_deref(), cli.continue_session)?;
-            launch_tui(
+            let options = frontend::tui::options_from_config(
                 prompt,
-                model,
-                &cli.model,
+                model.or_else(|| cli.model.clone()),
                 cli.provider.clone(),
                 &config,
                 &creds,
                 save_sessions,
                 previous_session,
-            )
-            .await?;
+            );
+            frontend::tui::run(options).await?;
         }
         Some(Commands::New { action }) => match action {
             NewAction::Agent { name } => new_agent::run(name)?,
@@ -358,17 +424,16 @@ async fn main() -> Result<()> {
             // No subcommand — launch TUI like Claude Code
             let previous_session =
                 load_requested_session(cli.session.as_deref(), cli.continue_session)?;
-            launch_tui(
+            let options = frontend::tui::options_from_config(
                 None,
-                None,
-                &cli.model,
+                cli.model.clone(),
                 cli.provider.clone(),
                 &config,
                 &creds,
                 save_sessions,
                 previous_session,
-            )
-            .await?;
+            );
+            frontend::tui::run(options).await?;
         }
     }
 
@@ -400,30 +465,6 @@ fn load_run_prompt(prompt: Option<String>, file: Option<&str>) -> Result<String>
             .map_err(|err| anyhow::anyhow!("Failed to read prompt file '{}': {}", path, err)),
         (None, None) => anyhow::bail!("Missing prompt text or --file"),
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn launch_tui(
-    prompt: Option<String>,
-    model: Option<String>,
-    cli_model: &Option<String>,
-    provider_override: Option<String>,
-    config: &Config,
-    creds: &CredentialStore,
-    save_sessions: bool,
-    previous_session: Option<crate::session::Session>,
-) -> Result<()> {
-    let model = model.or_else(|| cli_model.clone());
-    let options = frontend::tui::options_from_config(
-        prompt,
-        model,
-        provider_override,
-        config,
-        creds,
-        save_sessions,
-        previous_session,
-    );
-    frontend::tui::run(options).await
 }
 
 #[cfg(test)]
