@@ -68,6 +68,22 @@ impl Statusline {
             "trace off"
         };
         let effort = app.thinking_effort.as_deref().unwrap_or("auto");
+        let sandbox = app.security.mode_label.as_str();
+        let plugin = app
+            .active_plugin_name()
+            .map(|name| format!("plugin:{name}"))
+            .unwrap_or_else(|| format!("plugins:{}", app.plugin_count()));
+        let queued = app.queued_inputs.len();
+        let search = if app.search.is_active() {
+            match app.search.position() {
+                Some((current, total)) => {
+                    format!("find:{current}/{total} '{}'", app.search.query)
+                }
+                None => format!("find:0 '{}'", app.search.query),
+            }
+        } else {
+            String::new()
+        };
 
         let pill_style = Style::default()
             .fg(self.theme.bg)
@@ -96,7 +112,19 @@ impl Statusline {
             Span::styled(trace, dim_style),
             Span::raw("  "),
             Span::styled(format!("effort:{}", effort), dim_style),
+            Span::raw("  "),
+            Span::styled(format!("sandbox:{}", sandbox), dim_style),
+            Span::raw("  "),
+            Span::styled(plugin, dim_style),
         ];
+        if queued > 0 {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(format!("queued:{}", queued), dim_style));
+        }
+        if !search.is_empty() {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(search, dim_style));
+        }
 
         // Right-side hints: only append if they fit in remaining space
         let current_w: usize = spans
