@@ -1,17 +1,11 @@
 use anyhow::Result;
 use colored::Colorize;
-use lattice_agent::{
-    default_tool_definitions,
-    tool_registry::{ToolHandler, ToolRegistry},
-    Agent, LoopEvent,
-};
-use lattice_bus::{AgentRegistry, Pipeline};
-use lattice_core::router::ModelRouter;
-use lattice_core::types::{Message, Role};
+use lattice::agent::prompt;
+use lattice::agent::{Agent, LoopEvent};
+use lattice::core::types::Role;
+use lattice::runtime::AgentSpec;
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::Path;
-use std::sync::Arc;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -38,8 +32,22 @@ pub async fn run(
         eprintln!("{}", format!("resolve: {} ...", model).dimmed());
     }
 
-    let router = ModelRouter::with_credentials(creds.to_hashmap());
-    let resolved = router.resolve(&model, provider_override)?;
+    let runtime = crate::runtime::model_runtime(creds.to_hashmap());
+    let messages = previous_session
+        .as_ref()
+        .map(crate::session::messages_for_agent)
+        .unwrap_or_default();
+    let mut spec = AgentSpec::new(model.clone())
+        .provider_override(provider_override.map(str::to_string))
+        .messages(messages)
+        .project_root(".")
+        .security(Some(security.clone()));
+    if let Some(system_prompt) = system_prompt {
+        spec = spec.system_prompt(system_prompt);
+    }
+    let built = runtime.build_agent(spec)?;
+    let mut agent = built.agent;
+    let resolved = built.model;
 
     if verbose {
         eprintln!(
@@ -50,21 +58,6 @@ pub async fn run(
 
     let resolved_model = resolved.canonical_id.clone();
     let resolved_provider = resolved.provider.clone();
-
-    let tools = default_tool_definitions();
-    let executor = crate::security::build_tool_executor(Path::new("."), &security)?;
-    let mut agent = Agent::new(resolved)
-        .with_tools(tools)
-        .with_tool_executor(Box::new(executor));
-    if let Some(ref audit) = security.audit {
-        agent = agent.with_audit(audit.clone());
-    }
-    if let Some(session) = previous_session.as_ref() {
-        agent.seed_messages(crate::session::messages_for_agent(session));
-    }
-    if let Some(system_prompt) = system_prompt {
-        agent.set_system_prompt(system_prompt);
-    }
 
     if verbose {
         eprintln!("{}", "streaming...".dimmed());
@@ -120,47 +113,17 @@ async fn dry_run_prompt(
     system_prompt: Option<&str>,
     previous_session: Option<&crate::session::Session>,
 ) -> Result<()> {
-    use lattice_agent::prompt;
-    use std::collections::HashMap;
-
-    // Use a default 128K model for dry-run to exercise full budget logic
-    let resolved = lattice_core::ResolvedModel {
-        canonical_id: model_name.to_string(),
-        api_model_id: model_name.to_string(),
-        provider: "dry-run".into(),
-        base_url: String::new(),
-        api_key: None,
-        api_protocol: lattice_core::catalog::ApiProtocol::OpenAiChat,
-        context_length: 131072,
-        provider_specific: HashMap::new(),
-        credential_status: lattice_core::CredentialStatus::NotRequired,
-    };
-
-    let mut registry = prompt::PromptRegistry::new();
-    if let Some(sp) = system_prompt {
-        registry.set_system_prompt(sp);
-    }
-
-    let ctx = prompt::AssemblyContext {
-        request_id: "dry-run",
-        memory: None,
-        model: &resolved,
-        user_input: prompt,
-        #[cfg(feature = "blob-store")]
-        blob_store: None,
-        bus_events: &[],
-    };
-    let (sections, budgets) = registry.collect(&ctx).await;
-    let rendered = prompt::compiler::compile(&sections, &budgets, prompt, &resolved)
-        .map_err(anyhow::Error::new)?;
     let history = previous_session
         .map(crate::session::messages_for_agent)
         .unwrap_or_default();
-    let agent_messages = merge_rendered_into_history(history, &rendered.messages);
+    let runtime = crate::runtime::model_runtime(HashMap::new());
+    let report = runtime
+        .dry_run_prompt(model_name, system_prompt, prompt, history)
+        .await?;
 
     println!("{}", "═══ Compiled Prompt (dry-run) ═══".green());
     println!("{}", "─ Input Sections ─".dimmed());
-    for (s, b) in sections.iter().zip(budgets.iter()) {
+    for (s, b) in report.sections.iter().zip(report.budgets.iter()) {
         let label = format!("{:?}", s.layer);
         let budget = match b {
             prompt::TokenBudget::Fixed(n) => format!("Fixed({})", n),
@@ -177,7 +140,7 @@ async fn dry_run_prompt(
     }
     println!();
     println!("{}", "─ Rendered Messages ─".dimmed());
-    for msg in &agent_messages {
+    for msg in &report.messages {
         let role_label = match msg.role {
             Role::System => "System".red(),
             Role::User => "User".cyan(),
@@ -190,39 +153,11 @@ async fn dry_run_prompt(
     println!("{}", "─ Stats ─".dimmed());
     println!(
         "  total_tokens={:<6} context_length={}",
-        rendered.total_tokens.to_string().yellow(),
-        resolved.context_length.to_string().dimmed(),
+        report.rendered.total_tokens.to_string().yellow(),
+        report.resolved.context_length.to_string().dimmed(),
     );
 
     Ok(())
-}
-
-fn merge_rendered_into_history(mut messages: Vec<Message>, rendered: &[Message]) -> Vec<Message> {
-    let user_message_start = messages.len();
-    for msg in rendered {
-        match msg.role {
-            Role::System => {
-                if let Some(existing) = messages.iter_mut().find(|m| m.role == Role::System) {
-                    existing.content = msg.content.clone();
-                } else {
-                    messages.push(msg.clone());
-                }
-            }
-            Role::User => {
-                if let Some(existing) = messages
-                    .iter_mut()
-                    .skip(user_message_start)
-                    .find(|m| m.role == Role::User)
-                {
-                    existing.content = msg.content.clone();
-                } else {
-                    messages.push(msg.clone());
-                }
-            }
-            _ => {}
-        }
-    }
-    messages
 }
 
 /// Run a pipeline: load agent registry, create registries, and execute.
@@ -237,7 +172,7 @@ pub async fn run_pipeline(
     json: bool,
     creds: HashMap<String, String>,
 ) -> Result<()> {
-    let dir = super::safe_agents_dir(agents_dir).map_err(anyhow::Error::msg)?;
+    let (runtime, dir) = crate::runtime::pipeline_runtime(agents_dir, plugins_dir, creds)?;
 
     if verbose {
         eprintln!(
@@ -246,10 +181,7 @@ pub async fn run_pipeline(
         );
     }
 
-    let registry = Arc::new(
-        AgentRegistry::load_dir(&dir)
-            .map_err(|e| anyhow::anyhow!("Failed to load agents: {}", e))?,
-    );
+    let registry = runtime.agent_registry();
 
     if registry.list().is_empty() {
         anyhow::bail!("No agent profiles found in '{}'", dir.display());
@@ -265,52 +197,14 @@ pub async fn run_pipeline(
         }
     }
 
-    // Build ToolRegistry with default tool definitions
-    let mut tool_registry = ToolRegistry::new();
-    for td in default_tool_definitions() {
-        let name = td.name.clone();
-        tool_registry.register(
-            &name,
-            ToolHandler::Native(Arc::new(move |_| {
-                Ok("execution delegated to Agent tool executor".into())
-            })),
-            td,
-        );
-    }
-    let tool_registry = Arc::new(tool_registry);
-
-    // Build PluginRegistry with official plugins plus optional local manifests.
-    let plugin_dir = plugins_dir.map(std::path::PathBuf::from);
-    let plugin_registry = crate::plugins::build_plugin_registry(plugin_dir.as_deref())?;
-    let mut _plugin_watcher = None;
-    if let Some(plugin_dir) = plugin_dir {
-        if plugin_dir.exists() {
-            _plugin_watcher = Some(
-                lattice_plugin::watcher::PluginWatcher::spawn(
-                    plugin_dir.clone(),
-                    plugin_registry.clone(),
-                    true,
-                )
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "Failed to watch plugin directory '{}': {}",
-                        plugin_dir.display(),
-                        e
-                    )
-                })?,
-            );
-        }
-    }
     if verbose {
-        for meta in plugin_registry.list() {
+        for meta in runtime.plugin_registry().list() {
             eprintln!("  plugin: {} — {}", meta.name, meta.description);
         }
     }
 
     // Validate pipeline chain before running
-    let pipeline_check =
-        Pipeline::new("pre-check", registry.clone(), None, None).with_credentials(creds.clone());
-    let report = pipeline_check.dry_run(start_agent);
+    let report = runtime.dry_run_pipeline(start_agent);
     if !report.valid {
         eprintln!("{}", "Pipeline validation failed:".red());
         for issue in &report.issues {
@@ -333,12 +227,7 @@ pub async fn run_pipeline(
         );
     }
 
-    // Run the pipeline with plugin & tool registries
-    let mut pipeline = Pipeline::new(start_agent, registry, None, None)
-        .with_plugin_registry(plugin_registry)
-        .with_tool_registry(tool_registry)
-        .with_credentials(creds);
-    let result = pipeline.run(start_agent, prompt).await;
+    let result = runtime.run_pipeline(start_agent, prompt).await;
 
     if json {
         let out = serde_json::json!({

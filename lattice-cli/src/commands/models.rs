@@ -1,18 +1,17 @@
 use anyhow::Result;
 use colored::Colorize;
-use lattice_core::router::ModelRouter;
 use std::collections::HashSet;
 
 use crate::credentials::CredentialStore;
 use crate::display::status_icon;
 
 pub fn run(auth_only: bool, creds: &CredentialStore) -> Result<()> {
-    let router = ModelRouter::with_credentials(creds.to_hashmap());
-    let authed: HashSet<String> = router.list_authenticated_models().into_iter().collect();
+    let runtime = crate::runtime::model_runtime(creds.to_hashmap());
+    let authed: HashSet<String> = runtime.list_authenticated_models().into_iter().collect();
     let models: Vec<String> = if auth_only {
         authed.iter().cloned().collect()
     } else {
-        router.list_models()
+        runtime.list_models()
     };
 
     for m in models {

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use colored::Colorize;
-use lattice_bus::LatticeDir;
+use lattice::bus::LatticeDir;
 use std::path::PathBuf;
 
 /// Show bus status: discover .lattice/ directory, display agents and bus config.

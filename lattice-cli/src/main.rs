@@ -8,6 +8,7 @@ mod credentials;
 mod display;
 mod frontend;
 mod plugins;
+mod runtime;
 mod security;
 mod session;
 
@@ -221,16 +222,17 @@ async fn main() -> Result<()> {
 
     // Initialize logging based on verbose or debug mode.
     if cli.verbose {
-        let _ = lattice_core::init_logging(true);
+        let _ = lattice::core::init_logging(true);
     } else if matches!(cli.command, Some(Commands::Debug { .. })) {
         let log_dir = dirs::home_dir()
             .map(|h| h.join(".lattice"))
             .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
         let log_path = log_dir.join("debug.log");
-        let _ =
-            lattice_core::init_debug_logging(log_path.to_str().unwrap_or("/tmp/lattice-debug.log"));
+        let _ = lattice::core::init_debug_logging(
+            log_path.to_str().unwrap_or("/tmp/lattice-debug.log"),
+        );
     } else {
-        let _ = lattice_core::init_logging(false);
+        let _ = lattice::core::init_logging(false);
     }
 
     let config = Config::load(cli.config.as_deref())?;

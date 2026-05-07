@@ -1,7 +1,6 @@
 use anyhow::Result;
 use colored::Colorize;
-use lattice_core::catalog::Catalog;
-use lattice_core::router::ModelRouter;
+use lattice::core::catalog::Catalog;
 
 use crate::config::Config;
 use crate::credentials::CredentialStore;
@@ -27,9 +26,9 @@ pub fn run(config: &Config, creds: &CredentialStore) -> Result<()> {
 
     // Models
     println!("\n{}", "Models:".bold());
-    let router = ModelRouter::with_credentials(creds.to_hashmap());
-    let authed = router.list_authenticated_models();
-    let all = router.list_models();
+    let runtime = crate::runtime::model_runtime(creds.to_hashmap());
+    let authed = runtime.list_authenticated_models();
+    let all = runtime.list_models();
     let authed_set: std::collections::HashSet<_> = authed.iter().cloned().collect();
 
     for m in &all[..all.len().min(20)] {
@@ -48,13 +47,13 @@ pub fn run(config: &Config, creds: &CredentialStore) -> Result<()> {
     // Detailed model status via inspect_model
     println!("\n{}", "Model Details:".bold());
     for m in &all[..all.len().min(20)] {
-        let result = lattice_core::inspect_model(m);
+        let result = runtime.inspect_model(m);
         match result {
             Ok(model) => {
                 let status = match model.credential_status {
-                    lattice_core::CredentialStatus::Present => "callable".green(),
-                    lattice_core::CredentialStatus::Missing => "no credential".red(),
-                    lattice_core::CredentialStatus::NotRequired => "no key needed".dimmed(),
+                    lattice::core::CredentialStatus::Present => "callable".green(),
+                    lattice::core::CredentialStatus::Missing => "no credential".red(),
+                    lattice::core::CredentialStatus::NotRequired => "no key needed".dimmed(),
                 };
                 println!("  {} -> {} [{}]", m, model.provider, status);
             }

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use colored::Colorize;
-use lattice_agent::{default_tool_definitions, Agent, DefaultToolExecutor, LoopEvent};
-use lattice_core::router::ModelRouter;
+use lattice::agent::LoopEvent;
+use lattice::runtime::AgentSpec;
 use std::time::Instant;
 
 fn flush_reasoning(buf: &str) {
@@ -22,8 +22,8 @@ pub async fn run(
 
     tracing::info!(model = %model, "debug: resolve start");
 
-    let router = ModelRouter::with_credentials(creds.to_hashmap());
-    let resolved = router.resolve(&model, provider_override.as_deref())?;
+    let runtime = crate::runtime::model_runtime(creds.to_hashmap());
+    let resolved = runtime.resolve_with_provider(&model, provider_override.as_deref())?;
 
     // Print resolve details with colored highlights
     println!(
@@ -84,15 +84,13 @@ pub async fn run(
 
     let start = Instant::now();
 
-    // Clone resolved for summary before moving into Agent
     let resolved_summary = resolved.clone();
-
-    let tools = default_tool_definitions();
-    let mut agent = Agent::new(resolved)
-        .with_tools(tools)
-        .with_tool_executor(Box::new(
-            DefaultToolExecutor::new(".").map_err(anyhow::Error::msg)?,
-        ));
+    let built = runtime.build_agent(
+        AgentSpec::new(model.clone())
+            .provider_override(provider_override)
+            .project_root("."),
+    )?;
+    let mut agent = built.agent;
 
     tracing::info!(prompt_len = prompt_text.len(), "debug: agent.run start");
 

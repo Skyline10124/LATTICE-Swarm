@@ -1,6 +1,6 @@
 use anyhow::Result;
 use colored::Colorize;
-use lattice_bus::AgentRegistry;
+use lattice::bus::AgentRegistry;
 
 pub fn run() -> Result<()> {
     let dir = super::safe_agents_dir(None).map_err(anyhow::Error::msg)?;

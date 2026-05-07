@@ -1,6 +1,5 @@
 use anyhow::Result;
 use colored::Colorize;
-use lattice_core::router::ModelRouter;
 
 use crate::credentials::CredentialStore;
 use crate::display::{credential_label, status_icon};
@@ -12,8 +11,8 @@ pub fn run(
     json: bool,
     creds: &CredentialStore,
 ) -> Result<()> {
-    let router = ModelRouter::with_credentials(creds.to_hashmap());
-    let resolved = router.resolve(model, provider_override)?;
+    let runtime = crate::runtime::model_runtime(creds.to_hashmap());
+    let resolved = runtime.resolve_with_provider(model, provider_override)?;
 
     if json {
         let out = serde_json::json!({

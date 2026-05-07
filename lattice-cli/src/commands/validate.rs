@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
 
 use anyhow::{bail, Result};
-use lattice_bus::{AgentRegistry, Pipeline};
+use lattice::bus::AgentRegistry;
+use lattice::runtime::Runtime;
 
 /// Validate all agent profiles in the default agents directory or a given path.
 pub fn run(dir: Option<String>) -> Result<()> {
@@ -30,6 +30,10 @@ pub fn run(dir: Option<String>) -> Result<()> {
 
     println!("Found {} agent(s) in '{}'\n", profile_count, path.display());
 
+    let runtime = Runtime::builder()
+        .name("validate")
+        .agent_registry(registry.clone())
+        .build();
     let mut errors = 0u32;
     let mut agent_names = HashSet::new();
 
@@ -42,7 +46,7 @@ pub fn run(dir: Option<String>) -> Result<()> {
             errors += 1;
         }
 
-        match lattice_core::resolve(&profile.agent.model) {
+        match runtime.resolve(&profile.agent.model) {
             Ok(_) => println!("    model: {} OK", profile.agent.model),
             Err(e) => {
                 println!("    model: {} — WARNING: {}", profile.agent.model, e);
@@ -73,10 +77,9 @@ pub fn run(dir: Option<String>) -> Result<()> {
         }
     }
 
-    // Detect circular handoff chains via Pipeline::dry_run
+    // Detect circular handoff chains via Runtime pipeline validation.
     for profile in registry.list() {
-        let pipeline = Pipeline::new("validate", Arc::new(registry.clone()), None, None);
-        let report = pipeline.dry_run(&profile.agent.name);
+        let report = runtime.dry_run_pipeline(&profile.agent.name);
         if report.circular {
             println!(
                 "    ERROR: circular handoff detected starting from '{}'",
