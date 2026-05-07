@@ -1,18 +1,24 @@
 use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
 use base64::Engine as _;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-use lattice_agent::{prompt::SystemPromptDelta, Agent, LoopEvent};
-use lattice_core::types::{Role, ToolDefinition};
-use lattice_plugin::registry::PluginRegistry;
+use lattice::agent::{prompt::SystemPromptDelta, Agent, LoopEvent};
+use lattice::core::types::{Role, ToolDefinition};
+use lattice::plugin::registry::PluginRegistry;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
 
 use crate::coding_agent::{self, CodingAgentBuildOptions};
 
 use super::event::Event;
+use super::state::{
+    estimated_message_rows, message_search_content, tool_display_content, tool_result_status,
+    AppStatus, ChatMessage, ClickAction, ClickZone, FileDiffDisplay, FileSnapshot, MenuKind,
+    MenuState, SearchState, SlashSuggestion, TextSelection, ToolStatus, SLASH_COMMANDS,
+};
 
 /// Helper: find byte index of the character just before `cursor`.
 fn prev_char_boundary(s: &str, cursor: usize) -> usize {
@@ -48,6 +54,8 @@ fn dispatch_loop_event(
     turn_id: u64,
     event: LoopEvent,
     errored: &std::sync::atomic::AtomicBool,
+    workdir: &Path,
+    security: &crate::security::RuntimeSecurity,
 ) {
     match event {
         LoopEvent::Token { text } => {
@@ -70,12 +78,16 @@ fn dispatch_loop_event(
         }
         LoopEvent::ToolCallRequired { calls } => {
             for call in calls {
+                let name = call.function.name;
+                let arguments = call.function.arguments;
+                let file_before = file_snapshot_for_tool(&name, &arguments, workdir, security);
                 let _ = tx.send(Event::ToolOutput {
                     turn_id,
                     call_id: call.id,
-                    name: call.function.name,
-                    arguments: call.function.arguments,
+                    name,
+                    arguments,
                     result: None,
+                    file_before,
                 });
             }
         }
@@ -86,6 +98,7 @@ fn dispatch_loop_event(
                 name: call.function.name,
                 arguments: call.function.arguments,
                 result: Some(result),
+                file_before: None,
             });
         }
         LoopEvent::Done { .. } => {}
@@ -102,125 +115,117 @@ fn dispatch_loop_event(
     }
 }
 
-/// A single message in the chat.
-pub(super) struct ChatMessage {
-    pub(super) role: Role,
-    pub(super) content: String,
-    pub(super) reasoning: Option<String>,
-    pub(super) collapsed: bool,
-    pub(super) reasoning_collapsed: bool,
-    pub(super) tool: Option<ToolDisplay>,
-    cached_lines:
-        std::cell::RefCell<Option<(usize, std::sync::Arc<Vec<ratatui::text::Line<'static>>>)>>,
-    cached_width: std::cell::Cell<Option<u16>>,
+fn file_snapshot_for_tool(
+    name: &str,
+    arguments: &str,
+    workdir: &Path,
+    security: &crate::security::RuntimeSecurity,
+) -> Option<FileSnapshot> {
+    let path = editable_file_path(name, arguments)?;
+    let resolved = resolve_tool_file_path(workdir, &path);
+    let resolved_str = resolved.to_string_lossy();
+    if security.sandbox.check_write(&resolved_str).is_err() {
+        return None;
+    }
+
+    let content = match read_file_for_diff(&resolved, &security.sandbox) {
+        DiffRead::Content(content) => Some(content),
+        DiffRead::Missing => None,
+        DiffRead::Unavailable => return None,
+    };
+
+    Some(FileSnapshot { path, content })
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub(super) enum ToolStatus {
-    Running,
-    Done,
-    Error,
+fn editable_file_path(name: &str, arguments: &str) -> Option<String> {
+    let args = serde_json::from_str::<serde_json::Value>(arguments.trim()).ok()?;
+    let path = match name {
+        "write_file" => args.get("path"),
+        "patch" => args.get("file_path").or_else(|| args.get("path")),
+        _ => None,
+    }?
+    .as_str()?
+    .trim();
+
+    (!path.is_empty()).then(|| path.to_string())
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct ToolDisplay {
-    pub(super) call_id: String,
-    pub(super) name: String,
-    pub(super) arguments: String,
-    pub(super) result: Option<String>,
-    pub(super) status: ToolStatus,
-    pub(super) started_at: std::time::Instant,
-    pub(super) finished_at: Option<std::time::Instant>,
+fn resolve_tool_file_path(workdir: &Path, path: &str) -> PathBuf {
+    workdir.join(path.trim_start_matches('/'))
 }
 
-impl Clone for ChatMessage {
-    fn clone(&self) -> Self {
-        Self {
-            role: self.role.clone(),
-            content: self.content.clone(),
-            reasoning: self.reasoning.clone(),
-            collapsed: self.collapsed,
-            reasoning_collapsed: self.reasoning_collapsed,
-            tool: self.tool.clone(),
-            cached_lines: std::cell::RefCell::new(None),
-            cached_width: std::cell::Cell::new(None),
-        }
+enum DiffRead {
+    Content(String),
+    Missing,
+    Unavailable,
+}
+
+fn read_file_for_diff(path: &Path, sandbox: &lattice::tools::SandboxConfig) -> DiffRead {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return DiffRead::Missing,
+        Err(_) => return DiffRead::Unavailable,
+    };
+
+    if !metadata.is_file() || metadata.len() > sandbox.max_read_size as u64 {
+        return DiffRead::Unavailable;
     }
-}
 
-impl std::fmt::Debug for ChatMessage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ChatMessage")
-            .field("role", &self.role)
-            .field("content", &self.content)
-            .field("reasoning", &self.reasoning)
-            .field("collapsed", &self.collapsed)
-            .field("reasoning_collapsed", &self.reasoning_collapsed)
-            .field("tool", &self.tool)
-            .finish_non_exhaustive()
+    let path_str = path.to_string_lossy();
+    if sandbox.check_read(&path_str).is_err() {
+        return DiffRead::Unavailable;
+    }
+
+    match std::fs::read_to_string(path) {
+        Ok(content) => DiffRead::Content(content),
+        Err(_) => DiffRead::Unavailable,
     }
 }
 
-impl ChatMessage {
-    pub(super) fn new(role: Role, content: String) -> Self {
-        Self {
-            role,
-            content,
-            reasoning: None,
-            collapsed: false,
-            reasoning_collapsed: true,
-            tool: None,
-            cached_lines: std::cell::RefCell::new(None),
-            cached_width: std::cell::Cell::new(None),
-        }
-    }
+fn completed_file_diff(
+    snapshot: &FileSnapshot,
+    workdir: &Path,
+    security: &crate::security::RuntimeSecurity,
+) -> Option<FileDiffDisplay> {
+    let resolved = resolve_tool_file_path(workdir, &snapshot.path);
+    let new_content = match read_file_for_diff(&resolved, &security.sandbox) {
+        DiffRead::Content(content) => content,
+        DiffRead::Missing | DiffRead::Unavailable => return None,
+    };
+    let old_content = snapshot.content.as_deref().unwrap_or_default();
+    let old_label = snapshot
+        .content
+        .as_ref()
+        .map(|_| format!("a/{}", snapshot.path))
+        .unwrap_or_else(|| "/dev/null".to_string());
+    let new_label = format!("b/{}", snapshot.path);
+    let diff = unified_diff(&old_label, &new_label, old_content, &new_content)?;
 
-    pub(super) fn tool_call(call_id: String, name: String, arguments: String) -> Self {
-        let mut message = Self::new(Role::Tool, String::new());
-        message.collapsed = true;
-        message.tool = Some(ToolDisplay {
-            call_id,
-            name,
-            arguments,
-            result: None,
-            status: ToolStatus::Running,
-            started_at: std::time::Instant::now(),
-            finished_at: None,
-        });
-        message
-    }
+    Some(FileDiffDisplay {
+        path: snapshot.path.clone(),
+        text: diff,
+    })
+}
 
-    pub(super) fn set_cache(
-        &self,
-        content_len: usize,
-        lines: Vec<ratatui::text::Line<'static>>,
-        width: u16,
-    ) {
-        self.cached_lines
-            .replace(Some((content_len, std::sync::Arc::new(lines))));
-        self.cached_width.set(Some(width));
+fn unified_diff(
+    old_label: &str,
+    new_label: &str,
+    old_content: &str,
+    new_content: &str,
+) -> Option<String> {
+    if old_content == new_content {
+        return None;
     }
-
-    pub(super) fn get_cache(
-        &self,
-        content_len: usize,
-        width: u16,
-    ) -> Option<std::sync::Arc<Vec<ratatui::text::Line<'static>>>> {
-        if self.cached_width.get() == Some(width) {
-            self.cached_lines
-                .borrow()
-                .as_ref()
-                .filter(|(cl, _)| *cl == content_len)
-                .map(|(_, lines)| lines.clone())
-        } else {
-            None
-        }
+    let diff = similar::TextDiff::from_lines(old_content, new_content);
+    let mut text = diff
+        .unified_diff()
+        .header(old_label, new_label)
+        .context_radius(3)
+        .to_string();
+    while text.ends_with('\n') {
+        text.pop();
     }
-
-    pub(super) fn invalidate_cache(&self) {
-        self.cached_lines.replace(None);
-        self.cached_width.set(None);
-    }
+    (!text.trim().is_empty()).then_some(text)
 }
 
 /// Send text to the terminal clipboard via OSC 52.
@@ -234,115 +239,6 @@ fn write_osc52_clipboard(text: &str) {
 }
 
 type ClipboardSink = Arc<dyn Fn(&str) + Send + Sync>;
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct SlashSuggestion {
-    pub(super) command: &'static str,
-    pub(super) description: &'static str,
-}
-
-const SLASH_COMMANDS: &[SlashSuggestion] = &[
-    SlashSuggestion {
-        command: "/help",
-        description: "show keyboard shortcuts",
-    },
-    SlashSuggestion {
-        command: "/clear",
-        description: "clear visible transcript",
-    },
-    SlashSuggestion {
-        command: "/new",
-        description: "start a fresh agent context",
-    },
-    SlashSuggestion {
-        command: "/model <name>",
-        description: "switch model or show current",
-    },
-    SlashSuggestion {
-        command: "/provider <name>",
-        description: "set provider override or show",
-    },
-    SlashSuggestion {
-        command: "/status",
-        description: "show current session state",
-    },
-    SlashSuggestion {
-        command: "/permissions <mode>",
-        description: "switch sandbox mode for later turns",
-    },
-    SlashSuggestion {
-        command: "/plugins",
-        description: "list available runtime plugins",
-    },
-    SlashSuggestion {
-        command: "/plugin <name>",
-        description: "run a prompt through a plugin",
-    },
-    SlashSuggestion {
-        command: "/tokens",
-        description: "show token breakdown",
-    },
-    SlashSuggestion {
-        command: "/find <text>",
-        description: "search the visible transcript",
-    },
-    SlashSuggestion {
-        command: "/next",
-        description: "jump to next search match",
-    },
-    SlashSuggestion {
-        command: "/prev",
-        description: "jump to previous search match",
-    },
-    SlashSuggestion {
-        command: "/effort <off|low..max>",
-        description: "set thinking effort level",
-    },
-    SlashSuggestion {
-        command: "/trace",
-        description: "toggle thinking trace on/off",
-    },
-    SlashSuggestion {
-        command: "/expand",
-        description: "expand last collapsed tool output",
-    },
-    SlashSuggestion {
-        command: "/copy",
-        description: "copy last assistant response",
-    },
-    SlashSuggestion {
-        command: "/save",
-        description: "force-save current session",
-    },
-    SlashSuggestion {
-        command: "/queue",
-        description: "show or clear queued prompts",
-    },
-    SlashSuggestion {
-        command: "/sessions restore <id>",
-        description: "list or restore a session",
-    },
-    SlashSuggestion {
-        command: "/quit",
-        description: "exit the TUI",
-    },
-];
-
-impl SlashSuggestion {
-    pub(super) fn name(&self) -> &'static str {
-        self.command
-            .split_whitespace()
-            .next()
-            .unwrap_or(self.command)
-    }
-
-    fn completion(&self) -> String {
-        match self.command.find('<') {
-            Some(idx) => self.command[..idx].trim_end().to_string() + " ",
-            None => self.name().to_string(),
-        }
-    }
-}
 
 /// Application state.
 pub(super) struct App {
@@ -396,41 +292,6 @@ pub(super) struct App {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct MenuState {
-    pub(super) kind: MenuKind,
-    pub(super) options: Vec<String>,
-    pub(super) index: usize,
-}
-
-#[derive(Debug, Clone)]
-pub(super) enum MenuKind {
-    Model,
-    Provider,
-    Permissions,
-    Plugin,
-}
-
-#[derive(Debug, Clone, Default)]
-pub(super) struct SearchState {
-    pub(super) query: String,
-    pub(super) matches: Vec<usize>,
-    pub(super) index: Option<usize>,
-    pub(super) target_message: Option<usize>,
-}
-
-impl SearchState {
-    pub(super) fn is_active(&self) -> bool {
-        !self.query.is_empty()
-    }
-
-    pub(super) fn position(&self) -> Option<(usize, usize)> {
-        self.index
-            .filter(|_| !self.matches.is_empty())
-            .map(|idx| (idx + 1, self.matches.len()))
-    }
-}
-
-#[derive(Debug, Clone)]
 struct PreparedSubmission {
     display: String,
     prompt: String,
@@ -444,33 +305,6 @@ struct RunPluginContext {
     system_prompt: String,
     output_contract_delta: Option<SystemPromptDelta>,
     tools: Vec<ToolDefinition>,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct TextSelection {
-    pub(super) start_row: u16,
-    pub(super) start_col: u16,
-    pub(super) end_row: u16,
-    pub(super) end_col: u16,
-    pub(super) active: bool, // true while mouse button held
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct ClickZone {
-    pub(super) rect: (u16, u16, u16, u16), // x, y, w, h
-    pub(super) action: ClickAction,
-}
-
-#[derive(Debug, Clone)]
-pub(super) enum ClickAction {
-    JumpToBottom,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(super) enum AppStatus {
-    Ready,
-    Streaming,
-    Error(String),
 }
 
 impl App {
@@ -498,7 +332,7 @@ impl App {
                 &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
             )
             .expect("default runtime security should build"),
-            plugin_registry: crate::plugins::build_plugin_registry(None).ok(),
+            plugin_registry: crate::plugins::build_plugin_registry().ok(),
             session: None,
             pending_user: None,
             event_tx: None,
@@ -986,8 +820,7 @@ impl App {
             self.status = AppStatus::Streaming;
             self.stream_started = Some(std::time::Instant::now());
 
-            let output = match coding_agent::run_bash_tool(&self.workdir, &self.security, cmd).await
-            {
+            let output = match self.security.execute_bash(&self.workdir, cmd).await {
                 Ok(output) if output.trim().is_empty() => "(no output)".to_string(),
                 Ok(output) => output.trim().to_string(),
                 Err(err) => format!("bash: {err}"),
@@ -1034,7 +867,7 @@ impl App {
         self.messages
             .push(ChatMessage::new(Role::User, display_text.clone()));
         self.token_count +=
-            lattice_core::tokens::TokenEstimator::estimate_text(&display_text) as usize;
+            lattice::core::tokens::TokenEstimator::estimate_text(&display_text) as usize;
         self.input.clear();
         self.input_cursor = 0;
         self.suggestion_index = 0;
@@ -1113,12 +946,14 @@ impl App {
         self.apply_requested_plugin_context(plugin.clone()).await;
 
         let agent_arc = self.agent.clone().unwrap();
+        let workdir = self.workdir.clone();
+        let security = self.security.clone();
         tokio::spawn(async move {
             let mut agent = agent_arc.lock().await;
             let errored = std::sync::atomic::AtomicBool::new(false);
             let _events = agent
                 .run_streaming(&prompt_text, 10, |event| {
-                    dispatch_loop_event(&tx, turn_id, event, &errored);
+                    dispatch_loop_event(&tx, turn_id, event, &errored, &workdir, &security);
                 })
                 .await;
 
@@ -1335,7 +1170,7 @@ impl App {
                 true
             }
             "/tokens" => {
-                use lattice_core::tokens::TokenEstimator;
+                use lattice::core::tokens::TokenEstimator;
                 let content_tokens: usize = self
                     .messages
                     .iter()
@@ -1946,10 +1781,10 @@ impl App {
                 last.content.push_str(&content);
             }
             self.token_count +=
-                lattice_core::tokens::TokenEstimator::estimate_text(&content) as usize;
+                lattice::core::tokens::TokenEstimator::estimate_text(&content) as usize;
         }
         if let Some(r) = reasoning {
-            self.token_count += lattice_core::tokens::TokenEstimator::estimate_text(&r) as usize;
+            self.token_count += lattice::core::tokens::TokenEstimator::estimate_text(&r) as usize;
             if self.reasoning_started.is_none() {
                 self.reasoning_started = Some(std::time::Instant::now());
             }
@@ -2010,6 +1845,7 @@ impl App {
         name: String,
         arguments: String,
         result: Option<String>,
+        file_before: Option<FileSnapshot>,
     ) {
         if !self.accepts_turn(turn_id) {
             return;
@@ -2029,6 +1865,22 @@ impl App {
         }
 
         if let Some(result) = result {
+            let file_diff = if tool_result_status(Some(&result)) == ToolStatus::Done {
+                self.messages
+                    .iter()
+                    .find(|msg| {
+                        msg.tool
+                            .as_ref()
+                            .is_some_and(|tool| tool.call_id == call_id)
+                    })
+                    .and_then(|msg| msg.tool.as_ref())
+                    .and_then(|tool| tool.file_before.as_ref())
+                    .and_then(|snapshot| {
+                        completed_file_diff(snapshot, &self.workdir, &self.security)
+                    })
+            } else {
+                None
+            };
             if let Some(msg) = self.messages.iter_mut().find(|msg| {
                 msg.tool
                     .as_ref()
@@ -2037,9 +1889,10 @@ impl App {
                 if let Some(tool) = msg.tool.as_mut() {
                     tool.result = Some(result);
                     tool.status = tool_result_status(tool.result.as_deref());
+                    tool.file_diff = file_diff;
                     tool.finished_at = Some(std::time::Instant::now());
                     msg.content = tool_display_content(tool);
-                    msg.collapsed = msg.content.lines().count() > 6;
+                    msg.collapsed = tool_message_row_count(msg) > 10;
                     msg.invalidate_cache();
                 }
             } else {
@@ -2049,7 +1902,7 @@ impl App {
                     tool.status = tool_result_status(tool.result.as_deref());
                     tool.finished_at = Some(std::time::Instant::now());
                     msg.content = tool_display_content(tool);
-                    msg.collapsed = msg.content.lines().count() > 6;
+                    msg.collapsed = tool_message_row_count(&msg) > 10;
                 }
                 self.messages.push(msg);
             }
@@ -2059,7 +1912,8 @@ impl App {
                 .is_some_and(|tool| tool.call_id == call_id)
         }) {
             let mut msg = ChatMessage::tool_call(call_id, name, arguments);
-            if let Some(tool) = msg.tool.as_ref() {
+            if let Some(tool) = msg.tool.as_mut() {
+                tool.file_before = file_before;
                 msg.content = tool_display_content(tool);
             }
             self.messages.push(msg);
@@ -2077,7 +1931,7 @@ impl App {
     }
 
     fn recount_tokens(&mut self) {
-        use lattice_core::tokens::TokenEstimator;
+        use lattice::core::tokens::TokenEstimator;
         let mut total = 0usize;
         for msg in &self.messages {
             total += TokenEstimator::estimate_text(&msg.content) as usize;
@@ -2140,94 +1994,21 @@ impl App {
     }
 }
 
+fn tool_message_row_count(msg: &ChatMessage) -> usize {
+    let diff_rows = msg
+        .tool
+        .as_ref()
+        .and_then(|tool| tool.file_diff.as_ref())
+        .map_or(0, |diff| diff.text.lines().count().saturating_add(3));
+    msg.content.lines().count().max(1).saturating_add(diff_rows)
+}
+
 fn role_from_session(role: &str) -> Role {
     match role.to_ascii_lowercase().as_str() {
         "assistant" => Role::Assistant,
         "system" => Role::System,
         "tool" => Role::Tool,
         _ => Role::User,
-    }
-}
-
-fn compact_json(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-
-    match serde_json::from_str::<serde_json::Value>(trimmed) {
-        Ok(value) => value.to_string(),
-        Err(_) => trimmed.to_string(),
-    }
-}
-
-fn trim_tool_result(result: &str) -> String {
-    const LIMIT: usize = 4000;
-    if result.len() <= LIMIT {
-        return result.to_string();
-    }
-
-    let mut end = LIMIT;
-    while !result.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut trimmed = result[..end].to_string();
-    trimmed.push_str("\n...[tool output truncated]");
-    trimmed
-}
-
-fn tool_result_status(result: Option<&str>) -> ToolStatus {
-    let result = result.unwrap_or_default().trim_start().to_ascii_lowercase();
-    if result.starts_with("error")
-        || result.starts_with("sandbox violation")
-        || result.contains("permission denied")
-        || result.contains("timed out")
-    {
-        ToolStatus::Error
-    } else {
-        ToolStatus::Done
-    }
-}
-
-fn tool_display_content(tool: &ToolDisplay) -> String {
-    let mut content = format!("{} {}", tool.name, compact_json(&tool.arguments));
-    let elapsed = tool
-        .finished_at
-        .unwrap_or_else(std::time::Instant::now)
-        .saturating_duration_since(tool.started_at);
-    let status = match tool.status {
-        ToolStatus::Running => "running".to_string(),
-        ToolStatus::Done => format!("done in {}", format_short_duration(elapsed)),
-        ToolStatus::Error => format!("error after {}", format_short_duration(elapsed)),
-    };
-    content.push_str(&format!("\nstatus: {status}"));
-    if let Some(result) = tool.result.as_deref() {
-        content.push('\n');
-        content.push_str(&trim_tool_result(result));
-    }
-    content
-}
-
-fn format_short_duration(duration: std::time::Duration) -> String {
-    let millis = duration.as_millis();
-    if millis < 1000 {
-        format!("{millis}ms")
-    } else {
-        let secs = duration.as_secs_f32();
-        format!("{secs:.1}s")
-    }
-}
-
-fn message_search_content(msg: &ChatMessage, transcript_mode: bool) -> String {
-    if transcript_mode {
-        match msg.reasoning.as_deref() {
-            Some(reasoning) if !reasoning.is_empty() => {
-                format!("{}\n{}", msg.content, reasoning)
-            }
-            _ => msg.content.clone(),
-        }
-    } else {
-        msg.content.clone()
     }
 }
 
@@ -2320,14 +2101,6 @@ fn plugin_augmented_system_prompt(workdir: &std::path::Path, plugin_prompt: &str
     )
 }
 
-fn estimated_message_rows(msg: &ChatMessage) -> usize {
-    let content_rows = msg.content.lines().count().max(1);
-    let reasoning_rows = msg.reasoning.as_ref().map_or(0, |r| r.lines().count());
-    content_rows
-        .saturating_add(reasoning_rows)
-        .saturating_add(1)
-}
-
 fn summarize_prompt(text: &str, max_chars: usize) -> String {
     let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut out = String::new();
@@ -2349,6 +2122,7 @@ impl Default for App {
 
 #[cfg(test)]
 mod tests {
+    use super::super::state::ToolStatus;
     use super::*;
 
     fn test_session() -> crate::session::Session {
@@ -2610,6 +2384,7 @@ mod tests {
             "list_directory".into(),
             r#"{"path":"."}"#.into(),
             Some("FILE Cargo.toml".into()),
+            None,
         );
 
         let msg = app.messages.last().unwrap();
@@ -2630,6 +2405,7 @@ mod tests {
             "read_file".into(),
             r#"{"path":"Cargo.toml"}"#.into(),
             None,
+            None,
         );
         app.apply_tool_output(
             1,
@@ -2637,12 +2413,62 @@ mod tests {
             "read_file".into(),
             r#"{"path":"Cargo.toml"}"#.into(),
             Some("package data".into()),
+            None,
         );
 
         assert_eq!(app.messages.len(), 1);
         let msg = app.messages.last().unwrap();
         assert!(msg.content.contains("package data"));
         assert_eq!(msg.tool.as_ref().unwrap().status, ToolStatus::Done);
+    }
+
+    #[test]
+    fn write_file_output_attaches_file_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.txt");
+        std::fs::write(&file, "old\nsame\n").unwrap();
+
+        let mut app = App::new();
+        app.workdir = dir.path().to_path_buf();
+        app.security = crate::security::default_runtime_security(&app.workdir).unwrap();
+        app.active_turn_id = Some(1);
+
+        app.apply_tool_output(
+            1,
+            "call-1".into(),
+            "write_file".into(),
+            r#"{"path":"notes.txt","content":"new\nsame\n"}"#.into(),
+            None,
+            Some(FileSnapshot {
+                path: "notes.txt".into(),
+                content: Some("old\nsame\n".into()),
+            }),
+        );
+        std::fs::write(&file, "new\nsame\n").unwrap();
+        app.apply_tool_output(
+            1,
+            "call-1".into(),
+            "write_file".into(),
+            r#"{"path":"notes.txt","content":"new\nsame\n"}"#.into(),
+            Some("Wrote 9 bytes to notes.txt".into()),
+            None,
+        );
+
+        let diff = &app
+            .messages
+            .last()
+            .unwrap()
+            .tool
+            .as_ref()
+            .unwrap()
+            .file_diff
+            .as_ref()
+            .unwrap()
+            .text;
+        assert!(diff.contains("--- a/notes.txt"));
+        assert!(diff.contains("+++ b/notes.txt"));
+        assert!(diff.contains("-old"));
+        assert!(diff.contains("+new"));
     }
 
     #[test]
@@ -2669,6 +2495,7 @@ mod tests {
             "call-1".into(),
             "read_file".into(),
             r#"{"path":"Cargo.toml"}"#.into(),
+            None,
             None,
         );
 

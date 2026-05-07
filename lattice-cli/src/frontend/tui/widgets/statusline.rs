@@ -6,7 +6,8 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use super::super::app::{App, AppStatus};
+use super::super::app::App;
+use super::super::state::AppStatus;
 use super::super::theme::Theme;
 
 pub(in crate::frontend::tui) struct Statusline {

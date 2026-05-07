@@ -15,6 +15,7 @@ use crate::credentials::CredentialStore;
 mod app;
 mod event;
 mod markdown;
+mod state;
 mod theme;
 mod ui;
 mod widgets;
@@ -71,9 +72,12 @@ pub(crate) async fn run(options: TuiOptions) -> Result<()> {
     let security = crate::security::build_runtime_security(&options.security_config, &app.workdir)?;
     app.security = security;
     app.security_config = options.security_config;
-    app.plugin_registry = Some(crate::plugins::build_plugin_registry(
-        options.plugin_dir.as_deref(),
-    )?);
+    let mut plugin_builder = lattice::runtime::Runtime::builder()
+        .plugin_registry(crate::plugins::build_plugin_registry()?);
+    if let Some(plugin_dir) = options.plugin_dir.as_deref() {
+        plugin_builder = plugin_builder.load_plugin_dir(plugin_dir.to_path_buf())?;
+    }
+    app.plugin_registry = Some(plugin_builder.build().plugin_registry());
     if let Some(session) = options.previous_session {
         app.load_session(session);
     }
@@ -102,6 +106,7 @@ pub(crate) async fn run(options: TuiOptions) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn options_from_config(
     prompt: Option<String>,
     model: Option<String>,
@@ -167,8 +172,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                     name,
                     arguments,
                     result,
+                    file_before,
                 } => {
-                    app.apply_tool_output(turn_id, call_id, name, arguments, result);
+                    app.apply_tool_output(turn_id, call_id, name, arguments, result, file_before);
                 }
                 event::Event::ModelInfo {
                     turn_id,

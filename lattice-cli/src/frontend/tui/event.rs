@@ -2,6 +2,8 @@ use crossterm::event::{self, Event as CEvent, KeyEvent, MouseEvent};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+use super::state::FileSnapshot;
+
 pub(super) enum Event {
     Tick,
     Key(KeyEvent),
@@ -23,6 +25,7 @@ pub(super) enum Event {
         name: String,
         arguments: String,
         result: Option<String>,
+        file_before: Option<FileSnapshot>,
     },
     /// Resolved model + provider info from the background task.
     ModelInfo {
