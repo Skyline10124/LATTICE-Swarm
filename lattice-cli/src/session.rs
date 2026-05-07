@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use lattice_core::types::{FunctionCall, Message, Role, ToolCall};
+use lattice::core::types::{FunctionCall, Message, Role, ToolCall};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -503,13 +503,13 @@ mod tests {
         let messages = messages_for_agent(&session);
 
         assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0].role, lattice_core::types::Role::User);
+        assert_eq!(messages[0].role, lattice::core::types::Role::User);
         assert_eq!(messages[0].content, "hello");
-        assert_eq!(messages[1].role, lattice_core::types::Role::Assistant);
+        assert_eq!(messages[1].role, lattice::core::types::Role::Assistant);
         assert_eq!(messages[1].content, "hi");
-        assert_eq!(messages[2].role, lattice_core::types::Role::Tool);
+        assert_eq!(messages[2].role, lattice::core::types::Role::Tool);
         assert_eq!(messages[2].content, "tool result");
-        assert_eq!(messages[3].role, lattice_core::types::Role::System);
+        assert_eq!(messages[3].role, lattice::core::types::Role::System);
         assert_eq!(messages[3].content, "system prompt");
     }
 

@@ -4,14 +4,14 @@ use std::collections::HashMap;
 use crate::config::Config;
 
 /// Nix Phase 1: Explicit credential store.
-/// Credentials are loaded once at startup and passed directly to ModelRouter
+/// Credentials are loaded once at startup and passed into Runtime model routing.
 /// via `with_credentials()`, eliminating the need for `std::env::set_var`.
 #[derive(Debug, Clone)]
 pub struct CredentialStore {
     values: HashMap<String, String>,
 }
 
-/// All env var names that lattice-core may look up.
+/// All env var names that the Runtime model router may look up.
 pub const KNOWN_ENV_VARS: &[&str] = &[
     "AI_GATEWAY_API_KEY",
     "ANTHROPIC_API_KEY",
@@ -78,7 +78,7 @@ impl CredentialStore {
         CredentialStore { values }
     }
 
-    /// Return credentials as a HashMap for ModelRouter::with_credentials().
+    /// Return credentials as a HashMap for Runtime construction.
     pub fn to_hashmap(&self) -> HashMap<String, String> {
         self.values.clone()
     }

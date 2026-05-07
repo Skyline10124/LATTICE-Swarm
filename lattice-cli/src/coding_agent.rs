@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use colored::Colorize;
-use lattice_agent::{default_tool_definitions, Agent, LoopEvent, ToolExecutor};
-use lattice_core::router::ModelRouter;
-use lattice_core::types::{FunctionCall, Message, ToolCall};
+use lattice::agent::{Agent, LoopEvent};
+use lattice::core::types::Message;
+use lattice::runtime::AgentSpec;
 
 use crate::security::RuntimeSecurity;
 
@@ -120,35 +120,33 @@ pub(crate) async fn run(options: CodingAgentOptions) -> Result<()> {
 }
 
 pub(crate) fn build_coding_agent(options: CodingAgentBuildOptions) -> Result<BuiltCodingAgent> {
-    let resolved = resolve_model(
-        &options.model,
-        options.provider_override.as_deref(),
-        options.credentials,
+    let runtime = crate::runtime::model_runtime(options.credentials);
+    let messages = if !options.prior_messages.is_empty() {
+        options.prior_messages
+    } else if let Some(session) = options.previous_session.as_ref() {
+        crate::session::messages_for_agent(session)
+    } else {
+        Vec::new()
+    };
+    let built = runtime.build_agent(
+        AgentSpec::new(options.model)
+            .provider_override(options.provider_override)
+            .system_prompt(coding_system_prompt(&options.workdir))
+            .messages(messages)
+            .thinking_effort(options.thinking_effort)
+            .project_root(options.workdir.to_string_lossy().to_string())
+            .security(Some(options.security.clone())),
     )?;
-    let model = resolved.canonical_id.clone();
-    let provider = resolved.provider.clone();
-    let context_limit = if resolved.context_length > 0 {
-        resolved.context_length
+    let model = built.model.canonical_id.clone();
+    let provider = built.model.provider.clone();
+    let context_limit = if built.model.context_length > 0 {
+        built.model.context_length
     } else {
         128000
     };
-    let executor = crate::security::build_tool_executor(&options.workdir, &options.security)?;
-    let mut agent = Agent::new(resolved)
-        .with_tools(default_tool_definitions())
-        .with_tool_executor(Box::new(executor))
-        .with_thinking_effort(options.thinking_effort);
-    if let Some(ref audit) = options.security.audit {
-        agent = agent.with_audit(audit.clone());
-    }
-    agent.set_system_prompt(&coding_system_prompt(&options.workdir));
-    if !options.prior_messages.is_empty() {
-        agent.seed_messages(options.prior_messages);
-    } else if let Some(session) = options.previous_session.as_ref() {
-        agent.seed_messages(crate::session::messages_for_agent(session));
-    }
 
     Ok(BuiltCodingAgent {
-        agent,
+        agent: built.agent,
         model,
         provider,
         context_limit,
@@ -156,8 +154,8 @@ pub(crate) fn build_coding_agent(options: CodingAgentBuildOptions) -> Result<Bui
 }
 
 pub(crate) fn authenticated_models(credentials: &HashMap<String, String>) -> Vec<String> {
-    let router = ModelRouter::with_credentials(credentials.clone());
-    router.list_authenticated_models()
+    let runtime = crate::runtime::model_runtime(credentials.clone());
+    runtime.list_authenticated_models()
 }
 
 pub(crate) fn authenticated_providers(credentials: &HashMap<String, String>) -> Vec<String> {
@@ -171,31 +169,6 @@ pub(crate) fn authenticated_providers(credentials: &HashMap<String, String>) -> 
         }
     }
     providers
-}
-
-pub(crate) async fn run_bash_tool(
-    workdir: &Path,
-    security: &RuntimeSecurity,
-    command: &str,
-) -> Result<String> {
-    let executor = crate::security::build_tool_executor(workdir, security)?;
-    let call = ToolCall {
-        id: "tui-bash".into(),
-        function: FunctionCall {
-            name: "bash".into(),
-            arguments: serde_json::json!({ "command": command }).to_string(),
-        },
-    };
-    Ok(executor.execute(&call).await)
-}
-
-fn resolve_model(
-    model: &str,
-    provider_override: Option<&str>,
-    credentials: HashMap<String, String>,
-) -> Result<lattice_core::ResolvedModel> {
-    let router = ModelRouter::with_credentials(credentials);
-    Ok(router.resolve(model, provider_override)?)
 }
 
 pub(crate) fn coding_system_prompt(workdir: &Path) -> String {

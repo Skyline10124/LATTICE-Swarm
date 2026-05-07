@@ -9,10 +9,7 @@ name = "lattice"
 path = "src/main.rs"
 
 [dependencies]
-lattice-core = { path = "../LATTICE-Runtime/lattice-core" }
-lattice-agent = { path = "../LATTICE-Runtime/lattice-agent" }
-lattice-bus = { path = "../LATTICE-Runtime/lattice-bus" }
-lattice-plugin = { path = "../LATTICE-Runtime/lattice-plugin" }
+lattice = { path = "../LATTICE-Runtime/lattice" }
 lattice-plugins = { path = "../LATTICE-Plugins/lattice-plugins" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 tracing = "0.1"
@@ -35,6 +32,10 @@ crossterm = "0.28"
 unicode-width = "0.2"
 pulldown-cmark = { version = "0.12", default-features = false }
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "parsing", "regex-fancy"] }
+similar = "2"
 
 [features]
-blob-store = ["lattice-agent/blob-store"]
+blob-store = ["lattice/blob-store"]
+
+[dev-dependencies]
+tempfile = "3"
