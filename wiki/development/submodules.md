@@ -49,6 +49,6 @@ git commit -m "Update plugins submodule"
 git push
 ```
 
-## Cargo Patch
+## Local Runtime Dependency
 
-Swarm's root `Cargo.toml` patches Runtime git dependencies to local submodule paths. This prevents two copies of Runtime crates from being compiled when `LATTICE-Plugins` is built inside Swarm.
+Swarm uses local path dependencies to `LATTICE-Runtime/lattice`. This prevents two copies of Runtime from being compiled when `LATTICE-Plugins` is built inside Swarm.

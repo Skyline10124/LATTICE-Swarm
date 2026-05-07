@@ -4,13 +4,13 @@ Swarm is not the runtime implementation. It hosts the CLI/TUI and submodule poin
 
 ```text
 Swarm CLI/TUI/main agent
-  → Runtime crates
+  → Runtime crate
   → official Plugins
 ```
 
 ## Main Maintenance Repositories
 
-- Runtime: execution internals, model calls, agent loop, plugin runtime, bus and Python binding.
+- Runtime: execution internals, model calls, agent loop, plugin runtime and bus orchestration.
 - Swarm: CLI/TUI, main coding agent, submodule pointers and user-facing workflows.
 - Plugins: official typed plugins.
 

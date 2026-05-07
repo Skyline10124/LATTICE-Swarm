@@ -4,7 +4,7 @@
 
 Swarm is the user-facing LATTICE repository. It owns the CLI, TUI and main-agent shell for repo-aware coding work, and embeds the two implementation repositories as submodules:
 
-- [LATTICE-Runtime](https://github.com/Skyline10124/LATTICE-Runtime): model routing, transports, agent loop, plugin runtime, bus and Python binding.
+- [LATTICE-Runtime](https://github.com/Skyline10124/LATTICE-Runtime): Rust runtime crate for model routing, transports, agent loop, plugin runtime and bus orchestration.
 - [LATTICE-Plugins](https://github.com/Skyline10124/LATTICE-Plugins): official typed plugins.
 
 The legacy mono-repo at `~/lattice` is no longer maintained. Primary maintenance happens in Runtime and Swarm.
@@ -27,11 +27,11 @@ git submodule update --init --recursive
 ```text
 LATTICE-Swarm/
 ├── lattice-cli/       CLI and ratatui TUI
-├── LATTICE-Runtime/   submodule: runtime crates
+├── LATTICE-Runtime/   submodule: Rust runtime crate
 └── LATTICE-Plugins/   submodule: official plugins
 ```
 
-Swarm uses local path dependencies into the submodules. The root `Cargo.toml` patches Runtime git dependencies so `LATTICE-Plugins` and `lattice-cli` use the same local Runtime instance during submodule development.
+Swarm uses local path dependencies into the submodules. `lattice-cli` and `LATTICE-Plugins` both depend on the same local `LATTICE-Runtime/lattice` crate during submodule development.
 
 ## Build
 

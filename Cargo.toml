@@ -7,8 +7,3 @@ version = "0.1.0"
 license = "Apache-2.0"
 edition = "2021"
 authors = ["LATTICE Contributors"]
-
-[patch."https://github.com/Skyline10124/LATTICE-Runtime.git"]
-lattice-core = { path = "LATTICE-Runtime/lattice-core" }
-lattice-agent = { path = "LATTICE-Runtime/lattice-agent" }
-lattice-plugin = { path = "LATTICE-Runtime/lattice-plugin" }

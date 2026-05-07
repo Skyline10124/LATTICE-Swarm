@@ -12,7 +12,7 @@ git submodule update --init --recursive
 
 ## Duplicate Runtime Types
 
-If Rust reports mismatched types from `lattice_plugin` or `PluginRegistry`, check that Swarm's root `Cargo.toml` still contains the Runtime patch section. It ensures Plugins uses the local Runtime submodule.
+If Rust reports mismatched Runtime types such as `PluginRegistry`, check that both `lattice-cli` and `LATTICE-Plugins` depend on the same local `LATTICE-Runtime/lattice` crate.
 
 ## Model Resolution Fails
 
